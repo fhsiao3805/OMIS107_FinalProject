@@ -66,3 +66,11 @@ Most bulletin sections don't state a subject code, so it's inferred from how eac
 - Only the undergraduate bulletin is covered. Graduate bulletins are published separately.
 - There are no email notifications. Students and tutors see changes on their schedule pages.
 - `python app.py` uses Flask's development server, which suits local use and demos. Use a production WSGI server for real deployment.
+
+## Changelog
+
+### 2026-11-11 — Login landing page
+
+- Updated `static/app.js` so an unqualified visit to `/` shows the login page, and successful login or signup opens the main page at `/home`. Logout returns to `/`.
+- Added `/home` as an alias for the Flask app page in `app.py` and updated the brand and “Find help” links to use it; the existing `#/` main-page route remains supported.
+- Updated `templates/index.html` and the relevant in-app links for `/home`; added route coverage in `tests/test_api.py`.

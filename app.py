@@ -256,6 +256,7 @@ def create_app(data_dir=None, clock=None, secure_cookies=None):
     # ---- Pages ----
 
     @app.get("/")
+    @app.get("/home")
     def index():
         return render_template("index.html")
 
