@@ -38,12 +38,14 @@ CREATE TABLE IF NOT EXISTS users (
   role TEXT NOT NULL CHECK (role IN ('student', 'tutor')),
   major_id INTEGER REFERENCES majors(id) ON DELETE SET NULL,
   bio TEXT NOT NULL DEFAULT '',
+  student_enabled INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
 CREATE TABLE IF NOT EXISTS sessions (
   token_hash TEXT PRIMARY KEY,
   user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  expires_at REAL NOT NULL
+  expires_at REAL NOT NULL,
+  active_role TEXT CHECK (active_role IN ('student', 'tutor'))
 );
 
 CREATE TABLE IF NOT EXISTS tutor_courses (
@@ -88,6 +90,12 @@ CREATE TABLE IF NOT EXISTS study_group_members (
 CREATE INDEX IF NOT EXISTS idx_members_user ON study_group_members (user_id);
 """
 
+# Columns added after the first release, so databases that already exist pick them up.
+ADDED_COLUMNS = {
+    "users": {"student_enabled": "INTEGER NOT NULL DEFAULT 0"},
+    "sessions": {"active_role": "TEXT CHECK (active_role IN ('student', 'tutor'))"},
+}
+
 
 def connect(path):
     """Opens a connection in autocommit mode; multi-statement writes use transaction()."""
@@ -102,6 +110,11 @@ def init_database(path):
     db = connect(path)
     db.execute("PRAGMA journal_mode = WAL")
     db.executescript(SCHEMA)
+    for table, columns in ADDED_COLUMNS.items():
+        existing = {row["name"] for row in db.execute(f"PRAGMA table_info({table})")}
+        for name, definition in columns.items():
+            if name not in existing:
+                db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
     db.close()
 
 

@@ -101,6 +101,122 @@ def test_duplicate_signup_rejected(app):
     assert res.status_code == 409
 
 
+def signup_as_student(app, email, password="long-enough-pw", client=None):
+    client = client or app.test_client()
+    return client, client.post("/api/auth/signup", json={"email": email, "name": "Other Name", "password": password, "role": "student", "majorId": 1})
+
+
+def dual_user(app, start=24):
+    """A tutor with a slot who has added student access. Starts in the student view."""
+    tutor, slot_id = tutor_with_slot(app, start)
+    assert tutor.post("/me/student-account").status_code == 201
+    return tutor, slot_id
+
+
+def test_tutor_signs_up_as_student_with_same_email(app):
+    t = User(app, "tutor")
+    client, res = signup_as_student(app, t.email.upper())
+    assert res.status_code == 201
+    assert res.json["user"]["role"] == "student"
+    assert res.json["user"]["roles"] == ["tutor", "student"]
+    assert res.json["user"]["name"] == "Pat Doe"
+    assert res.json["user"]["majorId"] == 1
+    assert client.post("/api/groups", json=group_body()).status_code == 201
+    assert client.get("/api/tutor/slots").status_code == 403
+
+    _, again = signup_as_student(app, t.email)
+    assert again.status_code == 409
+
+
+def test_adding_student_access_needs_the_tutor_password(app):
+    t = User(app, "tutor")
+    client, res = signup_as_student(app, t.email, password="wrong-password")
+    assert res.status_code == 401
+    assert "Set-Cookie" not in res.headers
+    assert t.get("/me").json["user"]["roles"] == ["tutor"]
+    assert client.get("/api/me").json["user"] is None
+
+
+def test_student_signup_guessing_shares_the_login_lockout(app):
+    t = User(app, "tutor")
+    for _ in range(10):
+        assert signup_as_student(app, t.email, password="wrong-password")[1].status_code == 401
+    assert signup_as_student(app, t.email)[1].status_code == 429
+    assert app.test_client().post("/api/auth/login", json={"email": t.email, "password": "long-enough-pw"}).status_code == 429
+
+
+def test_student_cannot_gain_tutor_access_through_signup(app):
+    s = User(app, "student")
+    res = app.test_client().post("/api/auth/signup", json={"email": s.email, "name": "A", "password": "long-enough-pw", "role": "tutor"})
+    assert res.status_code == 409
+    assert s.post("/me/role", {"role": "tutor"}).status_code == 403
+    assert s.post("/me/student-account").status_code == 403
+
+
+def test_switching_views_controls_permissions(app):
+    t, _ = dual_user(app)
+    assert t.get("/tutor/slots").status_code == 403
+    assert t.get("/me/schedule").status_code == 200
+
+    assert t.post("/me/role", {"role": "tutor"}).json["user"]["role"] == "tutor"
+    assert t.get("/me").json["user"]["role"] == "tutor"
+    assert t.get("/tutor/slots").status_code == 200
+    assert t.post("/groups", group_body()).status_code == 403
+    assert t.post("/me/role", {"role": "admin"}).status_code == 403
+
+
+def test_tutor_only_account_cannot_switch_to_student(app):
+    t = User(app, "tutor")
+    assert t.post("/me/role", {"role": "student"}).status_code == 403
+    assert t.post("/groups", group_body()).status_code == 403
+
+
+def test_login_starts_dual_user_in_tutor_view(app):
+    t, _ = dual_user(app)
+    res = app.test_client().post("/api/auth/login", json={"email": t.email, "password": "long-enough-pw"})
+    assert res.json["user"]["role"] == "tutor"
+    assert res.json["user"]["roles"] == ["tutor", "student"]
+
+
+def test_dual_user_cannot_book_own_slot(app):
+    t, slot_id = dual_user(app)
+    assert t.get("/availability?courses=1").json["slots"][0]["mine"] is True
+    assert t.post(f"/slots/{slot_id}/book", {"courseId": 1}).status_code == 400
+    assert User(app, "student").get("/availability?courses=1").json["slots"][0]["mine"] is False
+
+
+def test_dual_user_schedule_spans_both_roles(app):
+    t, _ = dual_user(app, 24)
+    assert t.post("/groups", group_body(24)).status_code == 409
+    assert t.post("/groups", group_body(30)).status_code == 201
+
+    other_tutor, other_slot = tutor_with_slot(app, 40)
+    assert t.post(f"/slots/{other_slot}/book", {"courseId": 1}).status_code == 201
+
+    t.post("/me/role", {"role": "tutor"})
+    assert t.post("/tutor/slots", {**span(30), "location": "L"}).status_code == 409
+    assert t.post("/tutor/slots", {**span(40), "location": "L"}).status_code == 409
+    assert t.post("/tutor/slots", {**span(50), "location": "L"}).status_code == 201
+
+
+def test_existing_database_gains_new_columns(tmp_path):
+    path = str(tmp_path / "old.db")
+    old = database.connect(path)
+    old.executescript(
+        """CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT NOT NULL UNIQUE COLLATE NOCASE, name TEXT NOT NULL,
+             password_hash TEXT NOT NULL, role TEXT NOT NULL, major_id INTEGER, bio TEXT NOT NULL DEFAULT '', created_at TEXT);
+           CREATE TABLE sessions (token_hash TEXT PRIMARY KEY, user_id INTEGER NOT NULL, expires_at REAL NOT NULL);
+           INSERT INTO users (email, name, password_hash, role) VALUES ('old@scu.edu', 'Old', 'x', 'tutor');"""
+    )
+    old.close()
+    database.init_database(path)
+    database.init_database(path)
+    db = database.connect(path)
+    assert db.execute("SELECT student_enabled FROM users").fetchone()[0] == 0
+    assert db.execute("SELECT active_role FROM sessions").fetchone() is None
+    db.close()
+
+
 def test_login_locks_out_repeated_guessing(app):
     s = User(app, "student")
     client = app.test_client()

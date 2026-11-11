@@ -217,22 +217,36 @@ def create_app(data_dir=None, clock=None, secure_cookies=None):
             raise HttpError(400, "Major not found.")
         return major_id
 
-    def assert_student_free(student_id, starts_at, ends_at):
-        """Rejects a time that overlaps the student's existing bookings or study groups."""
+    def assert_schedule_free(user_id, starts_at, ends_at, message="That overlaps something already on your schedule."):
+        """Rejects a time that overlaps the user's bookings, study groups, or own tutoring slots."""
         clash = get_db().execute(
             """SELECT 1 FROM bookings b JOIN tutor_slots s ON s.id = b.slot_id
                  WHERE b.student_id = :id AND s.cancelled_at IS NULL AND s.starts_at < :end AND s.ends_at > :start
                UNION ALL
                SELECT 1 FROM study_group_members m JOIN study_groups g ON g.id = m.group_id
                  WHERE m.user_id = :id AND g.starts_at < :end AND g.ends_at > :start
+               UNION ALL
+               SELECT 1 FROM tutor_slots s
+                 WHERE s.tutor_id = :id AND s.cancelled_at IS NULL AND s.starts_at < :end AND s.ends_at > :start
                LIMIT 1""",
-            {"id": student_id, "start": starts_at, "end": ends_at},
+            {"id": user_id, "start": starts_at, "end": ends_at},
         ).fetchone()
         if clash:
-            raise HttpError(409, "That overlaps something already on your schedule.")
+            raise HttpError(409, message)
 
-    def start_session(response, user_id):
-        token = auth.create_session(get_db(), user_id, now().timestamp())
+    def check_password(email, row, password, failure_message):
+        """Verifies a password under the attempt limit. `row` is None when the email is unknown."""
+        key = f"{request.remote_addr}|{email}"
+        instant = now().timestamp()
+        limiter.check(key, instant)
+        valid = auth.verify_password(row["password_hash"] if row else auth.DUMMY_HASH, password)
+        if row is None or not valid:
+            limiter.fail(key, instant)
+            raise HttpError(401, failure_message)
+        limiter.reset(key)
+
+    def start_session(response, user_id, active_role=None):
+        token = auth.create_session(get_db(), user_id, now().timestamp(), active_role)
         response.set_cookie(
             auth.SESSION_COOKIE, token, max_age=auth.SESSION_TTL_SECONDS,
             httponly=True, samesite="Strict", secure=secure_cookies, path="/",
@@ -259,17 +273,26 @@ def create_app(data_dir=None, clock=None, secure_cookies=None):
         if role not in ("student", "tutor"):
             raise HttpError(400, "Choose student or tutor.")
         major_id = optional_major(data.get("majorId"))
+        db = get_db()
+
+        # A tutor signing up as a student adds student access to the account they already have.
+        existing = db.execute("SELECT id, role, password_hash, student_enabled FROM users WHERE email = ?", (email,)).fetchone()
+        if existing and role == "student" and existing["role"] == "tutor" and not existing["student_enabled"]:
+            check_password(email, existing, password, "That email has a tutor account. Enter its password to add student access.")
+            db.execute("UPDATE users SET student_enabled = 1, major_id = COALESCE(major_id, ?) WHERE id = ?", (major_id, existing["id"]))
+            response = jsonify(user=auth.load_user(db, existing["id"], "student"))
+            response.status_code = 201
+            return start_session(response, existing["id"], "student")
 
         password_hash = auth.hash_password(password)
         try:
-            user_id = get_db().execute(
+            user_id = db.execute(
                 "INSERT INTO users (email, name, password_hash, role, major_id) VALUES (?, ?, ?, ?, ?)",
                 (email, name, password_hash, role, major_id),
             ).lastrowid
         except sqlite3.IntegrityError as err:
             raise HttpError(409, "An account with that email already exists.") from err
-        user = {"id": user_id, "email": email, "name": name, "role": role, "majorId": major_id, "bio": ""}
-        response = jsonify(user=user)
+        response = jsonify(user=auth.load_user(db, user_id))
         response.status_code = 201
         return start_session(response, user_id)
 
@@ -278,20 +301,9 @@ def create_app(data_dir=None, clock=None, secure_cookies=None):
         data = body()
         email = text_field(data.get("email"), "Email", 254).lower()
         password = text_field(data.get("password"), "Password", 200)
-        key = f"{request.remote_addr}|{email}"
-        instant = now().timestamp()
-        limiter.check(key, instant)
-
         row = get_db().execute("SELECT id, password_hash FROM users WHERE email = ?", (email,)).fetchone()
-        valid = auth.verify_password(row["password_hash"] if row else auth.DUMMY_HASH, password)
-        if row is None or not valid:
-            limiter.fail(key, instant)
-            raise HttpError(401, "Incorrect email or password.")
-        limiter.reset(key)
-        user = dict(get_db().execute(
-            "SELECT id, email, name, role, major_id AS majorId, bio FROM users WHERE id = ?", (row["id"],)
-        ).fetchone())
-        return start_session(jsonify(user=user), row["id"])
+        check_password(email, row, password, "Incorrect email or password.")
+        return start_session(jsonify(user=auth.load_user(get_db(), row["id"])), row["id"])
 
     @app.post("/api/auth/logout")
     def logout():
@@ -313,6 +325,23 @@ def create_app(data_dir=None, clock=None, secure_cookies=None):
         major_id = optional_major(data.get("majorId"))
         get_db().execute("UPDATE users SET name = ?, bio = ?, major_id = ? WHERE id = ?", (name, bio, major_id, g.user["id"]))
         return jsonify(user={**g.user, "name": name, "bio": bio, "majorId": major_id})
+
+    @app.post("/api/me/role")
+    @signed_in
+    def switch_role():
+        role = body().get("role")
+        if role not in g.user["roles"]:
+            raise HttpError(403, "Your account does not have that view.")
+        auth.set_active_role(get_db(), request.cookies.get(auth.SESSION_COOKIE), role)
+        return jsonify(user={**g.user, "role": role})
+
+    @app.post("/api/me/student-account")
+    @tutor
+    def add_student_account():
+        db = get_db()
+        db.execute("UPDATE users SET student_enabled = 1 WHERE id = ?", (g.user["id"],))
+        auth.set_active_role(db, request.cookies.get(auth.SESSION_COOKIE), "student")
+        return jsonify(user=auth.load_user(db, g.user["id"], "student")), 201
 
     # ---- Catalog ----
 
@@ -389,16 +418,18 @@ def create_app(data_dir=None, clock=None, secure_cookies=None):
 
         slots = rows(db.execute(
             f"""SELECT s.id, s.starts_at AS startsAt, s.ends_at AS endsAt, s.location,
-                  u.name AS tutorName, u.bio AS tutorBio, GROUP_CONCAT(tc.course_id) AS courseIds
+                  u.name AS tutorName, u.bio AS tutorBio, GROUP_CONCAT(tc.course_id) AS courseIds,
+                  s.tutor_id = :me AS mine
                 FROM tutor_slots s
                 JOIN users u ON u.id = s.tutor_id
                 JOIN tutor_courses tc ON tc.tutor_id = s.tutor_id AND tc.course_id IN ({id_list})
                 WHERE {OPEN_SLOT}
                 GROUP BY s.id ORDER BY s.starts_at LIMIT 200""",
-            {"now": stamp},
+            {"now": stamp, "me": g.user["id"] if g.user else 0},
         ))
         for slot in slots:
             slot["courseIds"] = [int(v) for v in slot["courseIds"].split(",")]
+            slot["mine"] = bool(slot["mine"])
 
         groups = rows(db.execute(
             f"""SELECT g.id, g.course_id AS courseId, g.topic, g.starts_at AS startsAt, g.ends_at AS endsAt,
@@ -471,12 +502,7 @@ def create_app(data_dir=None, clock=None, secure_cookies=None):
             for week in range(repeat_weeks):
                 starts_at = iso(add_weeks(start, week))
                 ends_at = iso(add_weeks(end, week))
-                overlap = db.execute(
-                    "SELECT 1 FROM tutor_slots WHERE tutor_id = ? AND cancelled_at IS NULL AND starts_at < ? AND ends_at > ? LIMIT 1",
-                    (g.user["id"], ends_at, starts_at),
-                ).fetchone()
-                if overlap:
-                    raise HttpError(409, f"You already have a slot overlapping {starts_at[:10]}.")
+                assert_schedule_free(g.user["id"], starts_at, ends_at, f"You already have something scheduled overlapping {starts_at[:10]}.")
                 ids.append(db.execute(
                     "INSERT INTO tutor_slots (tutor_id, starts_at, ends_at, location) VALUES (?, ?, ?, ?)",
                     (g.user["id"], starts_at, ends_at, location),
@@ -517,13 +543,15 @@ def create_app(data_dir=None, clock=None, secure_cookies=None):
             ).fetchone()
             if slot is None:
                 raise HttpError(404, "That time slot is no longer available.")
+            if slot["tutor_id"] == g.user["id"]:
+                raise HttpError(400, "You cannot book your own time slot.")
             if not db.execute(
                 "SELECT 1 FROM tutor_courses WHERE tutor_id = ? AND course_id = ?", (slot["tutor_id"], course_id)
             ).fetchone():
                 raise HttpError(400, "That tutor does not offer this course.")
             if db.execute("SELECT 1 FROM bookings WHERE slot_id = ?", (slot_id,)).fetchone():
                 raise HttpError(409, "Someone just booked that slot.")
-            assert_student_free(g.user["id"], slot["starts_at"], slot["ends_at"])
+            assert_schedule_free(g.user["id"], slot["starts_at"], slot["ends_at"])
             db.execute(
                 "INSERT INTO bookings (slot_id, student_id, course_id, note) VALUES (?, ?, ?, ?)",
                 (slot_id, g.user["id"], course_id, note),
@@ -556,7 +584,7 @@ def create_app(data_dir=None, clock=None, secure_cookies=None):
         db = get_db()
         with transaction(db):
             require_course(course_id)
-            assert_student_free(g.user["id"], starts_at, ends_at)
+            assert_schedule_free(g.user["id"], starts_at, ends_at)
             group_id = db.execute(
                 """INSERT INTO study_groups (course_id, creator_id, topic, starts_at, ends_at, location, capacity)
                    VALUES (?, ?, ?, ?, ?, ?, ?)""",
@@ -581,7 +609,7 @@ def create_app(data_dir=None, clock=None, secure_cookies=None):
                 raise HttpError(409, "You already joined this group.")
             if group["members"] >= group["capacity"]:
                 raise HttpError(409, "This group is full.")
-            assert_student_free(g.user["id"], group["starts_at"], group["ends_at"])
+            assert_schedule_free(g.user["id"], group["starts_at"], group["ends_at"])
             db.execute("INSERT INTO study_group_members (group_id, user_id) VALUES (?, ?)", (group_id, g.user["id"]))
         return jsonify(ok=True), 201
 
