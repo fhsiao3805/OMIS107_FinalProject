@@ -72,6 +72,9 @@ def test_index_and_static_files_are_served(app):
     page = client.get("/")
     assert page.status_code == 200
     assert b"/static/app.js" in page.data
+    home = client.get("/home")
+    assert home.status_code == 200
+    assert b"/static/app.js" in home.data
     assert "default-src 'self'" in page.headers["Content-Security-Policy"]
     assert client.get("/static/app.js").status_code == 200
 

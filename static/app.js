@@ -111,10 +111,10 @@ function timeFields() {
 function renderNav() {
   const nav = document.getElementById('nav');
   const u = state.user;
-  const here = location.hash || '#/';
+  const here = location.hash || (location.pathname === '/home' ? '/home' : '#/login');
   const link = (href, label) => h('a', { href, ariaCurrent: here === href ? 'page' : null }, label);
   nav.replaceChildren(
-    link('#/', 'Find help'),
+    link('/home', 'Find help'),
     ...(u
       ? [
         u.role === 'tutor' ? link('#/tutor', 'Tutor dashboard') : link('#/schedule', 'My schedule'),
@@ -147,8 +147,7 @@ async function switchRole(role) {
 async function logout() {
   await act(() => api('/auth/logout', { method: 'POST' }));
   state.user = null;
-  location.hash = '#/';
-  route();
+  location.assign('/');
 }
 
 // ---- Find page ----
@@ -471,7 +470,7 @@ function loginPage() {
     h('p', {}),
     h('form', { onsubmit: submitter(async (values) => {
       state.user = (await api('/auth/login', { method: 'POST', body: values })).user;
-      goHome();
+      location.assign('/home');
     }) },
     field('SCU email', h('input', { type: 'email', name: 'email', required: true, autocomplete: 'username' })),
     field('Password', h('input', { type: 'password', name: 'password', required: true, autocomplete: 'current-password' })),
@@ -488,7 +487,7 @@ function signupPage() {
     h('p', {}),
     h('form', { onsubmit: submitter(async (values) => {
       state.user = (await api('/auth/signup', { method: 'POST', body: values })).user;
-      goHome();
+      location.assign('/home');
     }) },
     h('div', { className: 'roles' },
       role('student', 'Student', 'Book tutors and run study groups', true),
@@ -566,9 +565,9 @@ async function schedulePage() {
     h('div', { className: 'intro' }, h('h1', {}, 'My schedule')),
     h('div', { className: 'stack' },
       h('section', {}, h('h2', {}, 'Tutoring sessions'), h('div', { className: 'listing' },
-        bookingCards.length ? bookingCards : h('div', { className: 'empty' }, 'No tutoring booked. ', h('a', { href: '#/' }, 'Find a tutor')))),
+        bookingCards.length ? bookingCards : h('div', { className: 'empty' }, 'No tutoring booked. ', h('a', { href: '/home' }, 'Find a tutor')))),
       h('section', {}, h('h2', {}, 'Study groups'), h('div', { className: 'listing' },
-        groupItems.length ? groupItems : h('div', { className: 'empty' }, 'You are not in any study groups. ', h('a', { href: '#/' }, 'Find one'))))),
+        groupItems.length ? groupItems : h('div', { className: 'empty' }, 'You are not in any study groups. ', h('a', { href: '/home' }, 'Find one'))))),
   );
 }
 
@@ -656,7 +655,7 @@ async function tutorPage() {
 // ---- Router ----
 
 async function route() {
-  const hash = location.hash || '#/';
+  const hash = location.hash || (location.pathname === '/home' ? '#/' : '#/login');
   const u = state.user;
   const routes = {
     '#/': findPage,
