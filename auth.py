@@ -31,12 +31,12 @@ def _hash_token(token):
     return hashlib.sha256(token.encode()).hexdigest()
 
 
-def create_session(db, user_id, now):
+def create_session(db, user_id, now, active_role=None):
     token = secrets.token_urlsafe(32)
     db.execute("DELETE FROM sessions WHERE expires_at < ?", (now,))
     db.execute(
-        "INSERT INTO sessions (token_hash, user_id, expires_at) VALUES (?, ?, ?)",
-        (_hash_token(token), user_id, now + SESSION_TTL_SECONDS),
+        "INSERT INTO sessions (token_hash, user_id, expires_at, active_role) VALUES (?, ?, ?, ?)",
+        (_hash_token(token), user_id, now + SESSION_TTL_SECONDS, active_role),
     )
     return token
 
@@ -46,16 +46,27 @@ def destroy_session(db, token):
         db.execute("DELETE FROM sessions WHERE token_hash = ?", (_hash_token(token),))
 
 
+def set_active_role(db, token, role):
+    db.execute("UPDATE sessions SET active_role = ? WHERE token_hash = ?", (role, _hash_token(token)))
+
+
+def load_user(db, user_id, active_role=None):
+    """The user as the API sees them: `role` is the current view, `roles` is every view they can use."""
+    user = dict(db.execute(
+        "SELECT id, email, name, role, major_id AS majorId, bio, student_enabled FROM users WHERE id = ?", (user_id,)
+    ).fetchone())
+    roles = ["tutor", "student"] if user.pop("student_enabled") else [user["role"]]
+    return {**user, "roles": roles, "role": active_role or user["role"]}
+
+
 def user_for_token(db, token, now):
     if not token:
         return None
-    row = db.execute(
-        """SELECT u.id, u.email, u.name, u.role, u.major_id AS majorId, u.bio
-           FROM sessions s JOIN users u ON u.id = s.user_id
-           WHERE s.token_hash = ? AND s.expires_at > ?""",
+    session = db.execute(
+        "SELECT user_id, active_role FROM sessions WHERE token_hash = ? AND expires_at > ?",
         (_hash_token(token), now),
     ).fetchone()
-    return dict(row) if row else None
+    return load_user(db, session["user_id"], session["active_role"]) if session else None
 
 
 class AttemptLimiter:

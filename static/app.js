@@ -119,10 +119,29 @@ function renderNav() {
       ? [
         u.role === 'tutor' ? link('#/tutor', 'Tutor dashboard') : link('#/schedule', 'My schedule'),
         link('#/profile', 'Profile'),
+        ...(u.roles.length > 1
+          ? [u.role === 'tutor'
+            ? h('button', { onclick: () => switchRole('student') }, 'Switch to student view')
+            : h('button', { onclick: () => switchRole('tutor') }, 'Switch to tutor view')]
+          : []),
         h('button', { onclick: logout }, 'Log out'),
       ]
       : [link('#/login', 'Log in'), link('#/signup', 'Sign up')]),
   );
+}
+
+const homeHash = () => (state.user.role === 'tutor' ? '#/tutor' : '#/');
+
+function goHome() {
+  if (location.hash === homeHash()) route();
+  else location.hash = homeHash();
+}
+
+async function switchRole(role) {
+  const switched = await act(async () => {
+    state.user = (await api('/me/role', { method: 'POST', body: { role } })).user;
+  }, `You are now in the ${role} view.`);
+  if (switched) goHome();
 }
 
 async function logout() {
@@ -315,7 +334,9 @@ async function findPage() {
           h('p', { className: 'muted' }, s.location),
           s.tutorBio && h('p', { className: 'muted small' }, s.tutorBio)),
         state.user?.role !== 'tutor' && h('div', { className: 'actions' },
-          h('button', { className: 'btn', onclick: () => (state.user ? bookSlot(s, courses) : needLogin()) }, 'Book')));
+          s.mine
+            ? h('span', { className: 'badge' }, 'Your time slot')
+            : h('button', { className: 'btn', onclick: () => (state.user ? bookSlot(s, courses) : needLogin()) }, 'Book')));
     });
   }
 
@@ -450,7 +471,7 @@ function loginPage() {
     h('p', {}),
     h('form', { onsubmit: submitter(async (values) => {
       state.user = (await api('/auth/login', { method: 'POST', body: values })).user;
-      location.hash = state.user.role === 'tutor' ? '#/tutor' : '#/';
+      goHome();
     }) },
     field('SCU email', h('input', { type: 'email', name: 'email', required: true, autocomplete: 'username' })),
     field('Password', h('input', { type: 'password', name: 'password', required: true, autocomplete: 'current-password' })),
@@ -467,11 +488,12 @@ function signupPage() {
     h('p', {}),
     h('form', { onsubmit: submitter(async (values) => {
       state.user = (await api('/auth/signup', { method: 'POST', body: values })).user;
-      location.hash = state.user.role === 'tutor' ? '#/tutor' : '#/';
+      goHome();
     }) },
     h('div', { className: 'roles' },
       role('student', 'Student', 'Book tutors and run study groups', true),
       role('tutor', 'Tutor', 'Offer courses and time slots', false)),
+    h('p', { className: 'small muted' }, 'Already a tutor? Choose Student and enter your tutor email and password to use the same account as a student.'),
     field('Full name', h('input', { type: 'text', name: 'name', required: true, maxLength: 80, autocomplete: 'name' })),
     field('SCU email', h('input', { type: 'email', name: 'email', required: true, placeholder: 'you@scu.edu', autocomplete: 'username' })),
     field('Password (at least 8 characters)', h('input', { type: 'password', name: 'password', required: true, minLength: 8, autocomplete: 'new-password' })),
@@ -484,15 +506,29 @@ function profilePage() {
   const u = state.user;
   view.replaceChildren(h('div', { className: 'narrow card' },
     h('h1', {}, 'Your profile'),
-    h('p', { className: 'muted small' }, `${u.email} · ${u.role === 'tutor' ? 'Tutor' : 'Student'}`),
+    h('p', { className: 'muted small' }, `${u.email} · ${u.roles.length > 1 ? 'Tutor and student' : u.role === 'tutor' ? 'Tutor' : 'Student'}`),
     h('form', { onsubmit: submitter(async (values) => {
       state.user = (await api('/me', { method: 'PATCH', body: values })).user;
       toast('Profile saved.');
     }) },
     field('Full name', h('input', { type: 'text', name: 'name', required: true, maxLength: 80, value: u.name })),
     field('Major', h('select', { name: 'majorId' }, majorOptions(u.majorId, 'No major selected'))),
-    u.role === 'tutor' && field('About you (shown with your time slots)', h('textarea', { name: 'bio', maxLength: 500, value: u.bio })),
-    h('button', { className: 'btn', type: 'submit' }, 'Save'))));
+    u.roles.includes('tutor') && field('About you (shown with your time slots)', h('textarea', { name: 'bio', maxLength: 500, value: u.bio })),
+    h('button', { className: 'btn', type: 'submit' }, 'Save')),
+    u.roles.length === 1 && u.role === 'tutor' && [
+      h('p', {}),
+      h('h2', {}, 'Student account'),
+      h('p', { className: 'muted small' }, 'Book tutors and join study groups with this same email and password.'),
+      h('button', {
+        className: 'btn secondary',
+        onclick: async () => {
+          const added = await act(async () => {
+            state.user = (await api('/me/student-account', { method: 'POST' })).user;
+          }, 'Student account added. You are now in the student view.');
+          if (added) goHome();
+        },
+      }, 'Add student account'),
+    ]));
 }
 
 // ---- Student schedule ----

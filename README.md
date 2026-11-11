@@ -4,6 +4,7 @@ A tutoring and study group platform for Santa Clara University students, built w
 
 - **Students** pick courses (searching or filtering by major), book a tutor's open time, or create and join study groups.
 - **Tutors** choose the courses they teach and publish available time slots, optionally repeating weekly.
+- **Tutors can also be students.** A tutor can add student access to their account and switch between the two views, using the same email and password.
 - **Course and major data** is read by the server from the public [SCU Undergraduate Bulletin](https://www.scu.edu/bulletin/undergraduate/).
 
 ## Run it
