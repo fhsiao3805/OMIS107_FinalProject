@@ -29,6 +29,8 @@ The app stops with a message if `DATABASE_URL` is not set, and creates any missi
 
 Run the tests with `python -m pytest tests`. They read only `TEST_DATABASE_URL`, never `DATABASE_URL`. They empty every table in that database before each test, so it must be a separate database used only for testing. The tests refuse to start if both variables name the same database. Without `TEST_DATABASE_URL`, the database tests are skipped. They use Flask's test client, so no server or browser is needed.
 
+On GitHub, [.github/workflows/tests.yml](.github/workflows/tests.yml) runs the tests on every pull request and every push to `main`. The job starts its own PostgreSQL database and points `TEST_DATABASE_URL` at it. It uses no secrets and deploys nothing, so it never reaches the Neon databases.
+
 If the database has no course list yet, the server crawls the bulletin in the background, which takes about 25 minutes. The course list fills in as it goes.
 
 ## Project layout
