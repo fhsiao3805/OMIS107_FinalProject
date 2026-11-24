@@ -1,5 +1,9 @@
-# Runs the test suite against a throwaway PostgreSQL database that lives only inside this job.
-# No secrets are used and nothing is deployed, so the tests can never reach the Neon databases.
+# Runs the test suite on every pull request and every push to main, then deploys to Cloud Run
+# after a push to main whose tests pass.
+#
+# The test job uses a throwaway PostgreSQL database that lives only inside the job, and no
+# secrets, so the tests can never reach the Neon databases. Only the deploy job reads the
+# GCP_CREDENTIALS secret, and it writes the key outside the repository checkout.
 name: Tests
 
 on:
@@ -10,9 +14,11 @@ on:
 permissions:
   contents: read
 
+# A newer push to a pull request cancels the older run. Runs on main are never cancelled,
+# so a deploy can't be stopped halfway.
 concurrency:
   group: tests-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
   test:
@@ -56,3 +62,41 @@ jobs:
 
       - name: Run tests
         run: python -m pytest tests -rxs
+
+  deploy:
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # One deploy at a time; a newer one waits for the current one instead of cancelling it.
+    concurrency:
+      group: deploy-scu-study-tutor-groups
+      cancel-in-progress: false
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Sign in to Google Cloud
+        env:
+          GCP_CREDENTIALS: ${{ secrets.GCP_CREDENTIALS }}
+        run: |
+          if [ -z "$GCP_CREDENTIALS" ]; then
+            echo "::error::The GCP_CREDENTIALS secret is not set."
+            exit 1
+          fi
+          # Outside the checkout, so the key can't end up in the repository or the uploaded source.
+          key="$RUNNER_TEMP/gcp-credentials.json"
+          (umask 077 && printf '%s' "$GCP_CREDENTIALS" > "$key")
+          gcloud auth activate-service-account --key-file="$key"
+          rm -f "$key"
+
+      - name: Deploy to Cloud Run
+        run: >-
+          gcloud run deploy scu-study-tutor-groups
+          --source .
+          --project scu-study-tutor-groups
+          --region us-west1
+          --allow-unauthenticated
+          --quiet
