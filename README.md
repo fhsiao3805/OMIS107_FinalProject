@@ -9,7 +9,14 @@ A tutoring and study group platform for Santa Clara University students, built w
 
 ## Run it
 
-Requires Python 3.11 or newer.
+Requires Python 3.11 or newer and a PostgreSQL database (such as one on [Neon](https://neon.tech)).
+
+Put the connection strings in a `.env` file in the project folder. It is listed in `.gitignore`, so it stays on your machine:
+
+```sh
+DATABASE_URL=postgresql://USER:PASSWORD@HOST/DBNAME?sslmode=require
+TEST_DATABASE_URL=postgresql://USER:PASSWORD@HOST/DBNAME?sslmode=require
+```
 
 ```sh
 python3 -m venv .venv
@@ -18,16 +25,18 @@ pip install -r requirements.txt
 python app.py                    # http://localhost:8000
 ```
 
-Run the tests with `python -m pytest tests`.
+The app stops with a message if `DATABASE_URL` is not set, and creates any missing tables when it starts. On a server, set `DATABASE_URL` in the host's environment settings instead of a `.env` file.
 
-If `data/` has no course list yet, the server crawls the bulletin in the background, which takes about 25 minutes. The course list fills in as it goes.
+Run the tests with `python -m pytest tests`. They read only `TEST_DATABASE_URL`, never `DATABASE_URL`. They create a temporary database beside it, run there, and drop it afterwards, so they never change existing tables even when both variables name the same database. The account in `TEST_DATABASE_URL` needs permission to create databases. Without `TEST_DATABASE_URL`, the database tests are skipped.
+
+If the database has no course list yet, the server crawls the bulletin in the background, which takes about 25 minutes. The course list fills in as it goes.
 
 ## Project layout
 
 | Path | Purpose |
 | --- | --- |
 | `app.py` | Flask application and all routes |
-| `db.py` | SQLite schema and connections |
+| `db.py` | PostgreSQL schema and connections |
 | `auth.py` | Passwords, sessions, login rate limiting |
 | `crawler/` | Bulletin crawler and parser |
 | `templates/`, `static/` | The web pages |
@@ -56,8 +65,10 @@ Most bulletin sections don't state a subject code, so it's inferred from how eac
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
+| `DATABASE_URL` | required | PostgreSQL connection string |
+| `TEST_DATABASE_URL` | none | Database the tests create their temporary database beside |
 | `PORT` | `8000` | HTTP port |
-| `DATA_DIR` | `./data` | Database and page cache |
+| `DATA_DIR` | `./data` | Bulletin page cache and crawl lock |
 | `SECURE_COOKIES` | off | `1` marks session cookies `Secure` (requires HTTPS) |
 
 ## Known limits

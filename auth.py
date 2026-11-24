@@ -33,9 +33,9 @@ def _hash_token(token):
 
 def create_session(db, user_id, now, active_role=None):
     token = secrets.token_urlsafe(32)
-    db.execute("DELETE FROM sessions WHERE expires_at < ?", (now,))
+    db.execute("DELETE FROM sessions WHERE expires_at < %s", (now,))
     db.execute(
-        "INSERT INTO sessions (token_hash, user_id, expires_at, active_role) VALUES (?, ?, ?, ?)",
+        "INSERT INTO sessions (token_hash, user_id, expires_at, active_role) VALUES (%s, %s, %s, %s)",
         (_hash_token(token), user_id, now + SESSION_TTL_SECONDS, active_role),
     )
     return token
@@ -43,17 +43,17 @@ def create_session(db, user_id, now, active_role=None):
 
 def destroy_session(db, token):
     if token:
-        db.execute("DELETE FROM sessions WHERE token_hash = ?", (_hash_token(token),))
+        db.execute("DELETE FROM sessions WHERE token_hash = %s", (_hash_token(token),))
 
 
 def set_active_role(db, token, role):
-    db.execute("UPDATE sessions SET active_role = ? WHERE token_hash = ?", (role, _hash_token(token)))
+    db.execute("UPDATE sessions SET active_role = %s WHERE token_hash = %s", (role, _hash_token(token)))
 
 
 def load_user(db, user_id, active_role=None):
     """The user as the API sees them: `role` is the current view, `roles` is every view they can use."""
     user = dict(db.execute(
-        "SELECT id, email, name, role, major_id AS majorId, bio, student_enabled FROM users WHERE id = ?", (user_id,)
+        'SELECT id, email, name, role, major_id AS "majorId", bio, student_enabled FROM users WHERE id = %s', (user_id,)
     ).fetchone())
     roles = ["tutor", "student"] if user.pop("student_enabled") else [user["role"]]
     return {**user, "roles": roles, "role": active_role or user["role"]}
@@ -63,7 +63,7 @@ def user_for_token(db, token, now):
     if not token:
         return None
     session = db.execute(
-        "SELECT user_id, active_role FROM sessions WHERE token_hash = ? AND expires_at > ?",
+        "SELECT user_id, active_role FROM sessions WHERE token_hash = %s AND expires_at > %s",
         (_hash_token(token), now),
     ).fetchone()
     return load_user(db, session["user_id"], session["active_role"]) if session else None

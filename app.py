@@ -5,7 +5,6 @@ Run with `python app.py`. See README.md for crawler commands.
 import logging
 import os
 import re
-import sqlite3
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -14,6 +13,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import click
+import psycopg
 from flask import Flask, g, jsonify, render_template, request
 from werkzeug.exceptions import HTTPException
 
@@ -32,8 +32,10 @@ MAX_LEAD = timedelta(days=180)
 MAX_REPEAT_WEEKS = 12
 DAY_SECONDS = 86_400
 
-OPEN_SLOT = "s.cancelled_at IS NULL AND s.starts_at > :now AND NOT EXISTS (SELECT 1 FROM bookings b WHERE b.slot_id = s.id)"
+OPEN_SLOT = "s.cancelled_at IS NULL AND s.starts_at > %(now)s AND NOT EXISTS (SELECT 1 FROM bookings b WHERE b.slot_id = s.id)"
 MEMBER_COUNT = "(SELECT COUNT(*) FROM study_group_members m WHERE m.group_id = g.id)"
+# The leading digits of a course number as an integer (0 if none), so "9A" sorts before "10".
+NUMBER_VALUE = "COALESCE(CAST(substring(c.number FROM '^[0-9]+') AS INTEGER), 0)"
 
 log = logging.getLogger("studyhub")
 
@@ -112,16 +114,17 @@ def rows(cursor):
 # ---- Application ----
 
 
-def create_app(data_dir=None, clock=None, secure_cookies=None):
+def create_app(data_dir=None, clock=None, secure_cookies=None, database_url=None):
+    """Builds the app. The database comes from DATABASE_URL unless `database_url` is given."""
     base = Path(data_dir or os.environ.get("DATA_DIR") or Path(__file__).parent / "data")
-    db_path = str(base / "app.db")
-    database.init_database(db_path)
+    db_url = database_url or database.database_url()
+    database.init_database(db_url)
     now = clock or (lambda: datetime.now(timezone.utc))
 
     app = Flask(__name__)
     app.config["MAX_CONTENT_LENGTH"] = 32 * 1024
     app.config["DATA_DIR"] = base
-    app.config["DB_PATH"] = db_path
+    app.config["DATABASE_URL"] = db_url
     app.config["CATALOG_STATE"] = {"crawling": False}
     if secure_cookies is None:
         secure_cookies = os.environ.get("SECURE_COOKIES") == "1"
@@ -130,7 +133,7 @@ def create_app(data_dir=None, clock=None, secure_cookies=None):
 
     def get_db():
         if "db" not in g:
-            g.db = database.connect(db_path)
+            g.db = database.connect(db_url)
         return g.db
 
     def now_iso():
@@ -206,14 +209,14 @@ def create_app(data_dir=None, clock=None, secure_cookies=None):
     tutor = require_role("tutor")
 
     def require_course(course_id):
-        if not get_db().execute("SELECT 1 FROM courses WHERE id = ? AND active = 1", (course_id,)).fetchone():
+        if not get_db().execute("SELECT 1 FROM courses WHERE id = %s AND active = 1", (course_id,)).fetchone():
             raise HttpError(404, "Course not found.")
 
     def optional_major(value):
         if value is None or value == "":
             return None
         major_id = positive_int(value, "Major")
-        if not get_db().execute("SELECT 1 FROM majors WHERE id = ?", (major_id,)).fetchone():
+        if not get_db().execute("SELECT 1 FROM majors WHERE id = %s", (major_id,)).fetchone():
             raise HttpError(400, "Major not found.")
         return major_id
 
@@ -221,13 +224,13 @@ def create_app(data_dir=None, clock=None, secure_cookies=None):
         """Rejects a time that overlaps the user's bookings, study groups, or own tutoring slots."""
         clash = get_db().execute(
             """SELECT 1 FROM bookings b JOIN tutor_slots s ON s.id = b.slot_id
-                 WHERE b.student_id = :id AND s.cancelled_at IS NULL AND s.starts_at < :end AND s.ends_at > :start
+                 WHERE b.student_id = %(id)s AND s.cancelled_at IS NULL AND s.starts_at < %(end)s AND s.ends_at > %(start)s
                UNION ALL
                SELECT 1 FROM study_group_members m JOIN study_groups g ON g.id = m.group_id
-                 WHERE m.user_id = :id AND g.starts_at < :end AND g.ends_at > :start
+                 WHERE m.user_id = %(id)s AND g.starts_at < %(end)s AND g.ends_at > %(start)s
                UNION ALL
                SELECT 1 FROM tutor_slots s
-                 WHERE s.tutor_id = :id AND s.cancelled_at IS NULL AND s.starts_at < :end AND s.ends_at > :start
+                 WHERE s.tutor_id = %(id)s AND s.cancelled_at IS NULL AND s.starts_at < %(end)s AND s.ends_at > %(start)s
                LIMIT 1""",
             {"id": user_id, "start": starts_at, "end": ends_at},
         ).fetchone()
@@ -277,10 +280,10 @@ def create_app(data_dir=None, clock=None, secure_cookies=None):
         db = get_db()
 
         # A tutor signing up as a student adds student access to the account they already have.
-        existing = db.execute("SELECT id, role, password_hash, student_enabled FROM users WHERE email = ?", (email,)).fetchone()
+        existing = db.execute("SELECT id, role, password_hash, student_enabled FROM users WHERE lower(email) = %s", (email,)).fetchone()
         if existing and role == "student" and existing["role"] == "tutor" and not existing["student_enabled"]:
             check_password(email, existing, password, "That email has a tutor account. Enter its password to add student access.")
-            db.execute("UPDATE users SET student_enabled = 1, major_id = COALESCE(major_id, ?) WHERE id = ?", (major_id, existing["id"]))
+            db.execute("UPDATE users SET student_enabled = 1, major_id = COALESCE(major_id, %s) WHERE id = %s", (major_id, existing["id"]))
             response = jsonify(user=auth.load_user(db, existing["id"], "student"))
             response.status_code = 201
             return start_session(response, existing["id"], "student")
@@ -288,10 +291,10 @@ def create_app(data_dir=None, clock=None, secure_cookies=None):
         password_hash = auth.hash_password(password)
         try:
             user_id = db.execute(
-                "INSERT INTO users (email, name, password_hash, role, major_id) VALUES (?, ?, ?, ?, ?)",
+                "INSERT INTO users (email, name, password_hash, role, major_id) VALUES (%s, %s, %s, %s, %s) RETURNING id",
                 (email, name, password_hash, role, major_id),
-            ).lastrowid
-        except sqlite3.IntegrityError as err:
+            ).fetchone()["id"]
+        except psycopg.errors.UniqueViolation as err:
             raise HttpError(409, "An account with that email already exists.") from err
         response = jsonify(user=auth.load_user(db, user_id))
         response.status_code = 201
@@ -302,7 +305,7 @@ def create_app(data_dir=None, clock=None, secure_cookies=None):
         data = body()
         email = text_field(data.get("email"), "Email", 254).lower()
         password = text_field(data.get("password"), "Password", 200)
-        row = get_db().execute("SELECT id, password_hash FROM users WHERE email = ?", (email,)).fetchone()
+        row = get_db().execute("SELECT id, password_hash FROM users WHERE lower(email) = %s", (email,)).fetchone()
         check_password(email, row, password, "Incorrect email or password.")
         return start_session(jsonify(user=auth.load_user(get_db(), row["id"])), row["id"])
 
@@ -324,7 +327,7 @@ def create_app(data_dir=None, clock=None, secure_cookies=None):
         name = text_field(data.get("name"), "Name", 80)
         bio = text_field(data.get("bio", ""), "Bio", 500, min_length=0)
         major_id = optional_major(data.get("majorId"))
-        get_db().execute("UPDATE users SET name = ?, bio = ?, major_id = ? WHERE id = ?", (name, bio, major_id, g.user["id"]))
+        get_db().execute("UPDATE users SET name = %s, bio = %s, major_id = %s WHERE id = %s", (name, bio, major_id, g.user["id"]))
         return jsonify(user={**g.user, "name": name, "bio": bio, "majorId": major_id})
 
     @app.post("/api/me/role")
@@ -340,7 +343,7 @@ def create_app(data_dir=None, clock=None, secure_cookies=None):
     @tutor
     def add_student_account():
         db = get_db()
-        db.execute("UPDATE users SET student_enabled = 1 WHERE id = ?", (g.user["id"],))
+        db.execute("UPDATE users SET student_enabled = 1 WHERE id = %s", (g.user["id"],))
         auth.set_active_role(db, request.cookies.get(auth.SESSION_COOKIE), "student")
         return jsonify(user=auth.load_user(db, g.user["id"], "student")), 201
 
@@ -362,20 +365,22 @@ def create_app(data_dir=None, clock=None, secure_cookies=None):
         where = ["c.active = 1"]
         params = {"now": now_iso()}
         for i, token in enumerate(request.args.get("q", "").split()[:8]):
-            params[f"t{i}"] = re.sub(r"[\\%_]", lambda m: "\\" + m[0], token)
+            escaped = re.sub(r"[\\%_]", lambda m: "\\" + m[0], token)
+            params[f"p{i}"] = escaped + "%"
+            params[f"c{i}"] = "%" + escaped + "%"
             where.append(
-                f"""(c.subject LIKE :t{i} || '%' ESCAPE '\\' OR c.number LIKE :t{i} || '%' ESCAPE '\\'
-                OR c.subject || c.number LIKE :t{i} || '%' ESCAPE '\\'
-                OR c.title LIKE '%' || :t{i} || '%' ESCAPE '\\' OR c.department LIKE '%' || :t{i} || '%' ESCAPE '\\')"""
+                f"""(c.subject ILIKE %(p{i})s ESCAPE '\\' OR c.number ILIKE %(p{i})s ESCAPE '\\'
+                OR c.subject || c.number ILIKE %(p{i})s ESCAPE '\\'
+                OR c.title ILIKE %(c{i})s ESCAPE '\\' OR c.department ILIKE %(c{i})s ESCAPE '\\')"""
             )
         if request.args.get("major"):
             params["major"] = positive_int(request.args["major"], "Major")
-            where.append("EXISTS (SELECT 1 FROM major_courses mc WHERE mc.course_id = c.id AND mc.major_id = :major)")
+            where.append("EXISTS (SELECT 1 FROM major_courses mc WHERE mc.course_id = c.id AND mc.major_id = %(major)s)")
         if request.args.get("available") == "1":
             where.append(
                 f"""(EXISTS (SELECT 1 FROM tutor_courses tc JOIN tutor_slots s ON s.tutor_id = tc.tutor_id
                       WHERE tc.course_id = c.id AND {OPEN_SLOT})
-                    OR EXISTS (SELECT 1 FROM study_groups g WHERE g.course_id = c.id AND g.starts_at > :now AND {MEMBER_COUNT} < g.capacity))"""
+                    OR EXISTS (SELECT 1 FROM study_groups g WHERE g.course_id = c.id AND g.starts_at > %(now)s AND {MEMBER_COUNT} < g.capacity))"""
             )
         limit = min(positive_int(request.args.get("limit", "40"), "Limit"), 100)
         offset = parse_int(request.args.get("offset", "0")) or 0
@@ -386,10 +391,10 @@ def create_app(data_dir=None, clock=None, secure_cookies=None):
         found = rows(db.execute(
             f"""SELECT c.id, c.subject, c.number, c.title, c.units, c.department, c.school,
                   (SELECT COUNT(DISTINCT s.id) FROM tutor_courses tc JOIN tutor_slots s ON s.tutor_id = tc.tutor_id
-                    WHERE tc.course_id = c.id AND {OPEN_SLOT}) AS openSlots,
-                  (SELECT COUNT(*) FROM study_groups g WHERE g.course_id = c.id AND g.starts_at > :now AND {MEMBER_COUNT} < g.capacity) AS openGroups
+                    WHERE tc.course_id = c.id AND {OPEN_SLOT}) AS "openSlots",
+                  (SELECT COUNT(*) FROM study_groups g WHERE g.course_id = c.id AND g.starts_at > %(now)s AND {MEMBER_COUNT} < g.capacity) AS "openGroups"
                 FROM courses c WHERE {clause}
-                ORDER BY c.subject, CAST(c.number AS INTEGER), c.number
+                ORDER BY c.subject, {NUMBER_VALUE}, c.number
                 LIMIT {limit} OFFSET {offset}""",
             params,
         ))
@@ -400,11 +405,10 @@ def create_app(data_dir=None, clock=None, secure_cookies=None):
         ids = id_csv(request.args.get("ids"), "Course")
         if not ids:
             return jsonify(courses=[])
-        marks = ",".join("?" * len(ids))
         return jsonify(courses=rows(get_db().execute(
-            f"""SELECT id, subject, number, title, units, description, department, source_url AS sourceUrl
-                FROM courses WHERE active = 1 AND id IN ({marks})""",
-            ids,
+            """SELECT id, subject, number, title, units, description, department, source_url AS "sourceUrl"
+                FROM courses WHERE active = 1 AND id = ANY(%s)""",
+            (ids,),
         )))
 
     @app.get("/api/availability")
@@ -418,14 +422,14 @@ def create_app(data_dir=None, clock=None, secure_cookies=None):
         stamp = now_iso()
 
         slots = rows(db.execute(
-            f"""SELECT s.id, s.starts_at AS startsAt, s.ends_at AS endsAt, s.location,
-                  u.name AS tutorName, u.bio AS tutorBio, GROUP_CONCAT(tc.course_id) AS courseIds,
-                  s.tutor_id = :me AS mine
+            f"""SELECT s.id, s.starts_at AS "startsAt", s.ends_at AS "endsAt", s.location,
+                  u.name AS "tutorName", u.bio AS "tutorBio", string_agg(tc.course_id::text, ',') AS "courseIds",
+                  s.tutor_id = %(me)s AS mine
                 FROM tutor_slots s
                 JOIN users u ON u.id = s.tutor_id
                 JOIN tutor_courses tc ON tc.tutor_id = s.tutor_id AND tc.course_id IN ({id_list})
                 WHERE {OPEN_SLOT}
-                GROUP BY s.id ORDER BY s.starts_at LIMIT 200""",
+                GROUP BY s.id, u.id ORDER BY s.starts_at LIMIT 200""",
             {"now": stamp, "me": g.user["id"] if g.user else 0},
         ))
         for slot in slots:
@@ -433,11 +437,11 @@ def create_app(data_dir=None, clock=None, secure_cookies=None):
             slot["mine"] = bool(slot["mine"])
 
         groups = rows(db.execute(
-            f"""SELECT g.id, g.course_id AS courseId, g.topic, g.starts_at AS startsAt, g.ends_at AS endsAt,
-                  g.location, g.capacity, {MEMBER_COUNT} AS memberCount, u.name AS creatorName,
-                  EXISTS (SELECT 1 FROM study_group_members m WHERE m.group_id = g.id AND m.user_id = :me) AS joined
+            f"""SELECT g.id, g.course_id AS "courseId", g.topic, g.starts_at AS "startsAt", g.ends_at AS "endsAt",
+                  g.location, g.capacity, {MEMBER_COUNT} AS "memberCount", u.name AS "creatorName",
+                  EXISTS (SELECT 1 FROM study_group_members m WHERE m.group_id = g.id AND m.user_id = %(me)s) AS joined
                 FROM study_groups g JOIN users u ON u.id = g.creator_id
-                WHERE g.course_id IN ({id_list}) AND g.starts_at > :now
+                WHERE g.course_id IN ({id_list}) AND g.starts_at > %(now)s
                 ORDER BY g.starts_at LIMIT 200""",
             {"now": stamp, "me": g.user["id"] if g.user else 0},
         ))
@@ -452,8 +456,8 @@ def create_app(data_dir=None, clock=None, secure_cookies=None):
     @tutor
     def tutor_courses():
         return jsonify(courses=rows(get_db().execute(
-            """SELECT c.id, c.subject, c.number, c.title FROM tutor_courses tc JOIN courses c ON c.id = tc.course_id
-               WHERE tc.tutor_id = ? ORDER BY c.subject, CAST(c.number AS INTEGER)""",
+            f"""SELECT c.id, c.subject, c.number, c.title FROM tutor_courses tc JOIN courses c ON c.id = tc.course_id
+               WHERE tc.tutor_id = %s ORDER BY c.subject, {NUMBER_VALUE}""",
             (g.user["id"],),
         )))
 
@@ -468,21 +472,21 @@ def create_app(data_dir=None, clock=None, secure_cookies=None):
         with transaction(db):
             for course_id in ids:
                 require_course(course_id)
-            db.execute("DELETE FROM tutor_courses WHERE tutor_id = ?", (g.user["id"],))
-            db.executemany("INSERT INTO tutor_courses (tutor_id, course_id) VALUES (?, ?)", [(g.user["id"], i) for i in ids])
+            db.execute("DELETE FROM tutor_courses WHERE tutor_id = %s", (g.user["id"],))
+            db.cursor().executemany("INSERT INTO tutor_courses (tutor_id, course_id) VALUES (%s, %s)", [(g.user["id"], i) for i in ids])
         return jsonify(ok=True)
 
     @app.get("/api/tutor/slots")
     @tutor
     def tutor_slots():
         return jsonify(slots=rows(get_db().execute(
-            """SELECT s.id, s.starts_at AS startsAt, s.ends_at AS endsAt, s.location, b.note,
-                 st.name AS studentName, st.email AS studentEmail, c.subject, c.number, c.title
+            """SELECT s.id, s.starts_at AS "startsAt", s.ends_at AS "endsAt", s.location, b.note,
+                 st.name AS "studentName", st.email AS "studentEmail", c.subject, c.number, c.title
                FROM tutor_slots s
                LEFT JOIN bookings b ON b.slot_id = s.id
                LEFT JOIN users st ON st.id = b.student_id
                LEFT JOIN courses c ON c.id = b.course_id
-               WHERE s.tutor_id = ? AND s.cancelled_at IS NULL AND s.ends_at > ?
+               WHERE s.tutor_id = %s AND s.cancelled_at IS NULL AND s.ends_at > %s
                ORDER BY s.starts_at""",
             (g.user["id"], now_iso()),
         )))
@@ -505,9 +509,9 @@ def create_app(data_dir=None, clock=None, secure_cookies=None):
                 ends_at = iso(add_weeks(end, week))
                 assert_schedule_free(g.user["id"], starts_at, ends_at, f"You already have something scheduled overlapping {starts_at[:10]}.")
                 ids.append(db.execute(
-                    "INSERT INTO tutor_slots (tutor_id, starts_at, ends_at, location) VALUES (?, ?, ?, ?)",
+                    "INSERT INTO tutor_slots (tutor_id, starts_at, ends_at, location) VALUES (%s, %s, %s, %s) RETURNING id",
                     (g.user["id"], starts_at, ends_at, location),
-                ).lastrowid)
+                ).fetchone()["id"])
         return jsonify(ids=ids), 201
 
     @app.delete("/api/tutor/slots/<int:slot_id>")
@@ -517,14 +521,14 @@ def create_app(data_dir=None, clock=None, secure_cookies=None):
         db = get_db()
         with transaction(db):
             slot = db.execute(
-                "SELECT id FROM tutor_slots WHERE id = ? AND tutor_id = ? AND cancelled_at IS NULL", (slot_id, g.user["id"])
+                "SELECT id FROM tutor_slots WHERE id = %s AND tutor_id = %s AND cancelled_at IS NULL", (slot_id, g.user["id"])
             ).fetchone()
             if slot is None:
                 raise HttpError(404, "Slot not found.")
-            if db.execute("SELECT 1 FROM bookings WHERE slot_id = ?", (slot_id,)).fetchone():
-                db.execute("UPDATE tutor_slots SET cancelled_at = ? WHERE id = ?", (now_iso(), slot_id))
+            if db.execute("SELECT 1 FROM bookings WHERE slot_id = %s", (slot_id,)).fetchone():
+                db.execute("UPDATE tutor_slots SET cancelled_at = %s WHERE id = %s", (now_iso(), slot_id))
             else:
-                db.execute("DELETE FROM tutor_slots WHERE id = ?", (slot_id,))
+                db.execute("DELETE FROM tutor_slots WHERE id = %s", (slot_id,))
         return jsonify(ok=True)
 
     # ---- Students: booking tutors ----
@@ -539,7 +543,7 @@ def create_app(data_dir=None, clock=None, secure_cookies=None):
         with transaction(db):
             slot = db.execute(
                 """SELECT tutor_id, starts_at, ends_at FROM tutor_slots
-                   WHERE id = ? AND cancelled_at IS NULL AND starts_at > ?""",
+                   WHERE id = %s AND cancelled_at IS NULL AND starts_at > %s""",
                 (slot_id, now_iso()),
             ).fetchone()
             if slot is None:
@@ -547,14 +551,14 @@ def create_app(data_dir=None, clock=None, secure_cookies=None):
             if slot["tutor_id"] == g.user["id"]:
                 raise HttpError(400, "You cannot book your own time slot.")
             if not db.execute(
-                "SELECT 1 FROM tutor_courses WHERE tutor_id = ? AND course_id = ?", (slot["tutor_id"], course_id)
+                "SELECT 1 FROM tutor_courses WHERE tutor_id = %s AND course_id = %s", (slot["tutor_id"], course_id)
             ).fetchone():
                 raise HttpError(400, "That tutor does not offer this course.")
-            if db.execute("SELECT 1 FROM bookings WHERE slot_id = ?", (slot_id,)).fetchone():
+            if db.execute("SELECT 1 FROM bookings WHERE slot_id = %s", (slot_id,)).fetchone():
                 raise HttpError(409, "Someone just booked that slot.")
             assert_schedule_free(g.user["id"], slot["starts_at"], slot["ends_at"])
             db.execute(
-                "INSERT INTO bookings (slot_id, student_id, course_id, note) VALUES (?, ?, ?, ?)",
+                "INSERT INTO bookings (slot_id, student_id, course_id, note) VALUES (%s, %s, %s, %s)",
                 (slot_id, g.user["id"], course_id, note),
             )
         return jsonify(ok=True), 201
@@ -562,7 +566,7 @@ def create_app(data_dir=None, clock=None, secure_cookies=None):
     @app.delete("/api/slots/<int:slot_id>/book")
     @student
     def cancel_booking(slot_id):
-        deleted = get_db().execute("DELETE FROM bookings WHERE slot_id = ? AND student_id = ?", (slot_id, g.user["id"])).rowcount
+        deleted = get_db().execute("DELETE FROM bookings WHERE slot_id = %s AND student_id = %s", (slot_id, g.user["id"])).rowcount
         if not deleted:
             raise HttpError(404, "Booking not found.")
         return jsonify(ok=True)
@@ -588,10 +592,10 @@ def create_app(data_dir=None, clock=None, secure_cookies=None):
             assert_schedule_free(g.user["id"], starts_at, ends_at)
             group_id = db.execute(
                 """INSERT INTO study_groups (course_id, creator_id, topic, starts_at, ends_at, location, capacity)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id""",
                 (course_id, g.user["id"], topic, starts_at, ends_at, location, capacity),
-            ).lastrowid
-            db.execute("INSERT INTO study_group_members (group_id, user_id) VALUES (?, ?)", (group_id, g.user["id"]))
+            ).fetchone()["id"]
+            db.execute("INSERT INTO study_group_members (group_id, user_id) VALUES (%s, %s)", (group_id, g.user["id"]))
         return jsonify(id=group_id), 201
 
     @app.post("/api/groups/<int:group_id>/join")
@@ -601,26 +605,26 @@ def create_app(data_dir=None, clock=None, secure_cookies=None):
         with transaction(db):
             group = db.execute(
                 f"""SELECT g.starts_at, g.ends_at, g.capacity, {MEMBER_COUNT} AS members
-                    FROM study_groups g WHERE g.id = ? AND g.starts_at > ?""",
+                    FROM study_groups g WHERE g.id = %s AND g.starts_at > %s""",
                 (group_id, now_iso()),
             ).fetchone()
             if group is None:
                 raise HttpError(404, "That study group is no longer available.")
-            if db.execute("SELECT 1 FROM study_group_members WHERE group_id = ? AND user_id = ?", (group_id, g.user["id"])).fetchone():
+            if db.execute("SELECT 1 FROM study_group_members WHERE group_id = %s AND user_id = %s", (group_id, g.user["id"])).fetchone():
                 raise HttpError(409, "You already joined this group.")
             if group["members"] >= group["capacity"]:
                 raise HttpError(409, "This group is full.")
             assert_schedule_free(g.user["id"], group["starts_at"], group["ends_at"])
-            db.execute("INSERT INTO study_group_members (group_id, user_id) VALUES (?, ?)", (group_id, g.user["id"]))
+            db.execute("INSERT INTO study_group_members (group_id, user_id) VALUES (%s, %s)", (group_id, g.user["id"]))
         return jsonify(ok=True), 201
 
     @app.delete("/api/groups/<int:group_id>/join")
     @student
     def leave_group(group_id):
         db = get_db()
-        if db.execute("SELECT 1 FROM study_groups WHERE id = ? AND creator_id = ?", (group_id, g.user["id"])).fetchone():
+        if db.execute("SELECT 1 FROM study_groups WHERE id = %s AND creator_id = %s", (group_id, g.user["id"])).fetchone():
             raise HttpError(400, "You created this group, so cancel it instead of leaving.")
-        deleted = db.execute("DELETE FROM study_group_members WHERE group_id = ? AND user_id = ?", (group_id, g.user["id"])).rowcount
+        deleted = db.execute("DELETE FROM study_group_members WHERE group_id = %s AND user_id = %s", (group_id, g.user["id"])).rowcount
         if not deleted:
             raise HttpError(404, "You are not in this group.")
         return jsonify(ok=True)
@@ -628,7 +632,7 @@ def create_app(data_dir=None, clock=None, secure_cookies=None):
     @app.delete("/api/groups/<int:group_id>")
     @student
     def delete_group(group_id):
-        deleted = get_db().execute("DELETE FROM study_groups WHERE id = ? AND creator_id = ?", (group_id, g.user["id"])).rowcount
+        deleted = get_db().execute("DELETE FROM study_groups WHERE id = %s AND creator_id = %s", (group_id, g.user["id"])).rowcount
         if not deleted:
             raise HttpError(404, "Study group not found.")
         return jsonify(ok=True)
@@ -639,29 +643,29 @@ def create_app(data_dir=None, clock=None, secure_cookies=None):
         db = get_db()
         stamp = now_iso()
         bookings = rows(db.execute(
-            """SELECT s.id AS slotId, s.starts_at AS startsAt, s.ends_at AS endsAt, s.location, s.cancelled_at AS cancelledAt, b.note,
-                 u.name AS tutorName, u.email AS tutorEmail, c.subject, c.number, c.title
+            """SELECT s.id AS "slotId", s.starts_at AS "startsAt", s.ends_at AS "endsAt", s.location, s.cancelled_at AS "cancelledAt", b.note,
+                 u.name AS "tutorName", u.email AS "tutorEmail", c.subject, c.number, c.title
                FROM bookings b
                JOIN tutor_slots s ON s.id = b.slot_id
                JOIN users u ON u.id = s.tutor_id
                JOIN courses c ON c.id = b.course_id
-               WHERE b.student_id = ? AND s.ends_at > ? ORDER BY s.starts_at""",
+               WHERE b.student_id = %s AND s.ends_at > %s ORDER BY s.starts_at""",
             (g.user["id"], stamp),
         ))
         groups = rows(db.execute(
-            """SELECT g.id, g.topic, g.starts_at AS startsAt, g.ends_at AS endsAt, g.location, g.capacity,
-                 g.creator_id = :me AS isCreator, c.subject, c.number, c.title
+            """SELECT g.id, g.topic, g.starts_at AS "startsAt", g.ends_at AS "endsAt", g.location, g.capacity,
+                 g.creator_id = %(me)s AS "isCreator", c.subject, c.number, c.title
                FROM study_group_members m
                JOIN study_groups g ON g.id = m.group_id
                JOIN courses c ON c.id = g.course_id
-               WHERE m.user_id = :me AND g.ends_at > :now ORDER BY g.starts_at""",
+               WHERE m.user_id = %(me)s AND g.ends_at > %(now)s ORDER BY g.starts_at""",
             {"me": g.user["id"], "now": stamp},
         ))
         for group in groups:
             group["isCreator"] = bool(group["isCreator"])
             group["members"] = rows(db.execute(
                 """SELECT u.name, u.email FROM study_group_members m JOIN users u ON u.id = m.user_id
-                   WHERE m.group_id = ? ORDER BY u.name""",
+                   WHERE m.group_id = %s ORDER BY u.name""",
                 (group["id"],),
             ))
         return jsonify(bookings=bookings, groups=groups)
@@ -684,7 +688,7 @@ def create_app(data_dir=None, clock=None, secure_cookies=None):
             )
             click.echo({**summary, "pages": len(summary["pages"])})
             if not no_import:
-                connection = database.connect(db_path)
+                connection = database.connect(db_url)
                 click.echo(import_catalog(connection, cache, complete=summary["complete"]))
                 connection.close()
         finally:
@@ -694,7 +698,7 @@ def create_app(data_dir=None, clock=None, secure_cookies=None):
     @click.option("--complete", is_flag=True, help="Treat the cache as a full crawl, retiring courses no longer listed.")
     def import_command(complete):
         """Rebuild the catalog from downloaded pages, with no network requests."""
-        connection = database.connect(db_path)
+        connection = database.connect(db_url)
         click.echo(import_catalog(connection, PageCache(base / "cache"), complete=complete))
         connection.close()
 
@@ -707,7 +711,7 @@ def create_app(data_dir=None, clock=None, secure_cookies=None):
 def refresh_catalog(app):
     """Crawls the bulletin unless a complete crawl is recent enough."""
     refresh_days = float(os.environ.get("BULLETIN_REFRESH_DAYS", 30))
-    connection = database.connect(app.config["DB_PATH"])
+    connection = database.connect(app.config["DATABASE_URL"])
     state = app.config["CATALOG_STATE"]
     try:
         last = connection.execute("SELECT value FROM catalog_meta WHERE key = 'last_complete_crawl'").fetchone()

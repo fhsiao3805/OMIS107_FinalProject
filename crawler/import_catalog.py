@@ -12,7 +12,7 @@ CHAPTER_URL = re.compile(r"/chapter-[3-6]-")
 
 def _set_meta(db, key, value):
     db.execute(
-        "INSERT INTO catalog_meta (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+        "INSERT INTO catalog_meta (key, value) VALUES (%s, %s) ON CONFLICT (key) DO UPDATE SET value = excluded.value",
         (key, value),
     )
 
@@ -39,7 +39,7 @@ def import_catalog(db, cache, complete=False):
         for course in courses:
             db.execute(
                 """INSERT INTO courses (subject, number, title, description, units, department, school, source_url, active)
-                   VALUES (:subject, :number, :title, :description, :units, :department, :school, :sourceUrl, 1)
+                   VALUES (%(subject)s, %(number)s, %(title)s, %(description)s, %(units)s, %(department)s, %(school)s, %(sourceUrl)s, 1)
                    ON CONFLICT (subject, number) DO UPDATE SET title = excluded.title, description = excluded.description,
                      units = excluded.units, department = excluded.department, school = excluded.school,
                      source_url = excluded.source_url, active = 1""",
@@ -51,18 +51,18 @@ def import_catalog(db, cache, complete=False):
         seen = []
         for major in majors:
             db.execute(
-                """INSERT INTO majors (name, school, source_url) VALUES (?, ?, ?)
+                """INSERT INTO majors (name, school, source_url) VALUES (%s, %s, %s)
                    ON CONFLICT (name) DO UPDATE SET school = excluded.school, source_url = excluded.source_url""",
                 (major["name"], major["school"], major["sourceUrl"]),
             )
-            major_id = db.execute("SELECT id FROM majors WHERE name = ?", (major["name"],)).fetchone()[0]
+            major_id = db.execute("SELECT id FROM majors WHERE name = %s", (major["name"],)).fetchone()[0]
             seen.append(major_id)
-            db.executemany(
-                "INSERT OR IGNORE INTO major_courses (major_id, course_id) VALUES (?, ?)",
+            db.cursor().executemany(
+                "INSERT INTO major_courses (major_id, course_id) VALUES (%s, %s) ON CONFLICT DO NOTHING",
                 [(major_id, course_ids[key]) for key in major["courses"]],
             )
         if retire and seen:
-            db.execute(f"DELETE FROM majors WHERE id NOT IN ({','.join(map(str, seen))})")
+            db.execute("DELETE FROM majors WHERE id <> ALL(%s)", (seen,))
 
         stamp = datetime.now(timezone.utc).isoformat()
         _set_meta(db, "last_import", stamp)
