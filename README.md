@@ -40,6 +40,7 @@ If the database has no course list yet, the server crawls the bulletin in the ba
 | Path | Purpose |
 | --- | --- |
 | `app.py` | Flask application and all routes |
+| `Procfile` | How Cloud Run starts the app: `gunicorn "app:create_app()"` |
 | `db.py` | PostgreSQL schema and connections |
 | `auth.py` | Passwords, sessions, login rate limiting |
 | `crawler/` | Bulletin crawler and parser |
