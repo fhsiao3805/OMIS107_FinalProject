@@ -108,7 +108,9 @@ TABLES = [
 ADDED_COLUMNS = {
     "users": {"student_enabled": "INTEGER NOT NULL DEFAULT 0"},
     "sessions": {"active_role": "TEXT CHECK (active_role IN ('student', 'tutor'))"},
-    # The name of the file shared in a tutoring session or study group; the file is in Cloud Storage.
+    # The names of shared files; the files themselves are in Cloud Storage. A tutoring session can
+    # have the tutor's file (on the time slot) and the student's file (on the booking).
+    "tutor_slots": {"attachment_name": "TEXT"},
     "bookings": {"attachment_name": "TEXT"},
     "study_groups": {"attachment_name": "TEXT"},
 }

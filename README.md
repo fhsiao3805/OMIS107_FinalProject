@@ -4,7 +4,10 @@ A tutoring and study group platform for Santa Clara University students, built w
 
 - **Students** pick courses (searching or filtering by major), book a tutor's open time, or create and join study groups.
 - **Tutors** choose the courses they teach and publish available time slots, optionally repeating weekly.
-- **Shared files.** In a booked tutoring session or a study group, anyone in it can share one PDF or image of up to 5 MB, such as notes, a practice exam or a study guide. Only the session's tutor and student, or the group's members, can open it.
+- **Shared files.** PDFs and images of up to 5 MB, such as notes, a practice exam or a study guide. A file can be attached when a tutor adds time slots, a student books one, or a student creates a study group, and changed later from the Tutor dashboard or My schedule.
+  - A tutoring session has two files. The tutor's file stays with the time slot, and the student's file stays with the booking. Each person can add, replace or remove only their own file. The session's tutor and student can open both.
+  - A student can't open the tutor's file until they book the slot. If they cancel, their own file is deleted, and the tutor's file stays for the next student.
+  - A study group has one file. Only the student who created the group can add, replace or remove it, and every member can open it.
 - **Tutors can also be students.** A tutor can add student access to their account and switch between the two views, using the same email and password.
 - **Course and major data** is read by the server from the public [SCU Undergraduate Bulletin](https://www.scu.edu/bulletin/undergraduate/).
 

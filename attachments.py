@@ -1,6 +1,7 @@
 """Files attached to tutoring sessions and study groups, kept in a private Cloud Storage bucket.
 
-Each session or group holds at most one file. The bucket is named by the ATTACHMENTS_BUCKET
+A tutoring session holds up to two files, the tutor's (on the time slot) and the student's
+(on the booking); a study group holds one, managed by the student who created it. The bucket is named by the ATTACHMENTS_BUCKET
 setting; without it, file sharing is switched off and the rest of the app works as before.
 """
 import os
@@ -48,6 +49,10 @@ def clean_name(filename, content_type):
         stem, extension = name, allowed[0]
     stem = stem[:MAX_NAME_LENGTH].strip() or "attachment"
     return stem + extension.lower()
+
+
+def slot_key(slot_id):
+    return f"slots/{slot_id}"
 
 
 def booking_key(booking_id):
