@@ -93,6 +93,23 @@ const dialogButtons = (close, label) => h('div', { className: 'dialog-actions' }
   h('button', { type: 'button', className: 'btn secondary', onclick: close }, 'Cancel'),
   h('button', { type: 'submit', className: 'btn' }, label));
 
+/** A dialog for editing a message of up to 500 characters. `save(text)` sends it to the server. */
+function editMessage({ context, label, value, save, reload }) {
+  modal('Edit your message', (close) => h('form', { onsubmit: submitter(async ({ message }) => {
+    await save(message);
+    close();
+    toast('Message updated.');
+    reload();
+  }) },
+  h('p', {}, context),
+  field(label, h('textarea', { name: 'message', maxLength: 500, value: value ?? '' })),
+  dialogButtons(close, 'Save message')));
+}
+
+const TUTOR_MESSAGE_LABEL = 'What can you help with? (optional)';
+const STUDENT_MESSAGE_LABEL = 'What do you need help with? (optional)';
+const GROUP_MESSAGE_LABEL = 'What do you want to study? (optional)';
+
 const MAX_FILE_BYTES = 5 * 1024 * 1024;
 const FILE_TYPES = 'application/pdf,image/png,image/jpeg,image/gif,image/webp';
 
@@ -382,6 +399,7 @@ async function findPage() {
           h('h3', {}, when(s)),
           h('p', {}, `${s.tutorName} · ${courses.map(courseCode).join(', ')}`),
           h('p', { className: 'muted' }, s.location),
+          s.tutorNote && h('p', {}, `"${s.tutorNote}"`),
           s.tutorBio && h('p', { className: 'muted small' }, s.tutorBio)),
         state.user?.role !== 'tutor' && h('div', { className: 'actions' },
           s.mine
@@ -426,8 +444,9 @@ async function findPage() {
     }) },
     h('p', {}, `${when(slot)} with ${slot.tutorName}`),
     h('p', { className: 'muted small' }, slot.location),
+    slot.tutorNote && h('p', { className: 'muted small' }, `${slot.tutorName}'s message: "${slot.tutorNote}"`),
     field('Course', h('select', { name: 'courseId', required: true }, courses.map((c) => h('option', { value: c.id }, `${courseCode(c)} ${c.title}`)))),
-    field('What do you need help with? (optional)', h('textarea', { name: 'note', maxLength: 500 })),
+    field(STUDENT_MESSAGE_LABEL, h('textarea', { name: 'note', maxLength: 500 })),
     fileField(),
     dialogButtons(close, 'Confirm booking')));
   }
@@ -445,6 +464,7 @@ async function findPage() {
     timeFields(),
     field('Location', h('input', { type: 'text', name: 'location', required: true, maxLength: 120, placeholder: 'Learning Commons, 2nd floor' })),
     field('Maximum group size', h('input', { type: 'number', name: 'capacity', required: true, min: 2, max: 30, value: 6 })),
+    field(GROUP_MESSAGE_LABEL, h('textarea', { name: 'note', maxLength: 500, placeholder: 'e.g. Practice problems from chapter 4' })),
     fileField(),
     dialogButtons(close, 'Create group')));
   }
@@ -591,17 +611,13 @@ async function schedulePage() {
   const reload = () => schedulePage();
   const asTutor = state.user.role === 'tutor';
 
-  function editNote(b) {
-    modal('Edit your message', (close) => h('form', { onsubmit: submitter(async ({ note }) => {
-      await api(`/slots/${b.slotId}/book/note`, { method: 'PUT', body: { note } });
-      close();
-      toast('Message updated.');
-      reload();
-    }) },
-    h('p', {}, `${b.subject} ${b.number} with ${b.tutorName} · ${when(b)}`),
-    field('What do you need help with? (optional)', h('textarea', { name: 'note', maxLength: 500, value: b.note ?? '' })),
-    dialogButtons(close, 'Save message')));
-  }
+  const editNote = (b) => editMessage({
+    context: `${b.subject} ${b.number} with ${b.tutorName} · ${when(b)}`,
+    label: STUDENT_MESSAGE_LABEL,
+    value: b.note,
+    save: (note) => api(`/slots/${b.slotId}/book/note`, { method: 'PUT', body: { note } }),
+    reload,
+  });
 
   const bookingCards = bookings.map((b) => h('article', { className: 'session' },
     h('div', {},
@@ -609,6 +625,7 @@ async function schedulePage() {
       h('p', {}, when(b)),
       h('p', { className: 'muted' }, `${b.location} · ${b.tutorEmail}`),
       b.cancelledAt && h('span', { className: 'badge warn' }, 'Cancelled by tutor'),
+      b.tutorNote && h('p', { className: 'muted small' }, `${b.tutorName}'s message: "${b.tutorNote}"`),
       h('p', { className: 'muted small' }, b.note ? `Your message: "${b.note}"` : 'No message shared.'),
       sharedFile(`/slots/${b.slotId}/attachment`, b.tutorFileName, reload, { label: "Tutor's file", canEdit: false }),
       sharedFile(`/slots/${b.slotId}/booking/attachment`, b.studentFileName, reload, { label: 'Your file', canEdit: true })),
@@ -619,20 +636,35 @@ async function schedulePage() {
         onclick: async () => { if (await act(() => api(`/slots/${b.slotId}/book`, { method: 'DELETE' }), 'Booking cancelled.')) reload(); },
       }, 'Cancel'))));
 
-  const groupItems = groups.map((g) => h('article', { className: 'session' },
-    h('div', {},
-      h('h3', {}, `${g.subject} ${g.number}: ${g.topic}`),
-      h('p', {}, when(g)),
-      h('p', { className: 'muted' }, `${g.location} · ${g.members.length} of ${g.capacity} joined`),
-      h('p', { className: 'muted small' }, g.members.map((m) => `${m.name} (${m.email})`).join(', ')),
-      sharedFile(`/groups/${g.id}/attachment`, g.attachmentName, reload, { label: 'Group file', canEdit: g.isCreator })),
-    h('div', { className: 'actions' }, h('button', {
-      className: 'btn secondary',
-      onclick: async () => {
-        const path = g.isCreator ? `/groups/${g.id}` : `/groups/${g.id}/join`;
-        if (await act(() => api(path, { method: 'DELETE' }), g.isCreator ? 'Study group cancelled.' : 'You left the group.')) reload();
-      },
-    }, g.isCreator ? 'Cancel group' : 'Leave'))));
+  const groupItems = groups.map((g) => {
+    const myNote = g.members.find((m) => m.isMe)?.note ?? '';
+    return h('article', { className: 'session' },
+      h('div', {},
+        h('h3', {}, `${g.subject} ${g.number}: ${g.topic}`),
+        h('p', {}, when(g)),
+        h('p', { className: 'muted' }, `${g.location} · ${g.members.length} of ${g.capacity} joined`),
+        h('ul', { className: 'muted small' }, g.members.map((m) => h('li', {},
+          `${m.isMe ? 'You' : `${m.name} (${m.email})`}${m.note ? `: "${m.note}"` : ''}`))),
+        sharedFile(`/groups/${g.id}/attachment`, g.attachmentName, reload, { label: 'Group file', canEdit: g.isCreator })),
+      h('div', { className: 'actions' },
+        h('button', {
+          className: 'btn secondary',
+          onclick: () => editMessage({
+            context: `${g.subject} ${g.number}: ${g.topic} · ${when(g)}`,
+            label: GROUP_MESSAGE_LABEL,
+            value: myNote,
+            save: (note) => api(`/groups/${g.id}/note`, { method: 'PUT', body: { note } }),
+            reload,
+          }),
+        }, myNote ? 'Edit message' : 'Add message'),
+        h('button', {
+          className: 'btn secondary',
+          onclick: async () => {
+            const path = g.isCreator ? `/groups/${g.id}` : `/groups/${g.id}/join`;
+            if (await act(() => api(path, { method: 'DELETE' }), g.isCreator ? 'Study group cancelled.' : 'You left the group.')) reload();
+          },
+        }, g.isCreator ? 'Cancel group' : 'Leave')));
+  });
 
   const sessionCards = asTutor ? slots.map((s) => tutorSlotCard(s, reload)) : bookingCards;
   const noSessions = asTutor
@@ -657,18 +689,30 @@ function tutorSlotCard(s, reload) {
     h('div', {},
       h('h3', {}, when(s)),
       h('p', { className: 'muted' }, s.location),
+      h('p', { className: 'muted small' }, s.tutorNote ? `Your message: "${s.tutorNote}"` : 'No message shared.'),
       s.studentName
-        ? [h('p', {}, `Booked by ${s.studentName} (${s.studentEmail}) for ${s.subject} ${s.number}`), s.note && h('p', { className: 'muted small' }, `"${s.note}"`)]
+        ? [h('p', {}, `Booked by ${s.studentName} (${s.studentEmail}) for ${s.subject} ${s.number}`), s.note && h('p', { className: 'muted small' }, `${s.studentName}'s message: "${s.note}"`)]
         : h('span', { className: 'badge' }, 'Open'),
       sharedFile(`/slots/${s.id}/attachment`, s.tutorFileName, reload, { label: 'Your file', canEdit: true }),
       s.studentName && sharedFile(`/slots/${s.id}/booking/attachment`, s.studentFileName, reload, { label: "Student's file", canEdit: false })),
-    h('div', { className: 'actions' }, h('button', {
-      className: 'btn secondary',
-      onclick: async () => {
-        if (s.studentName && !window.confirm(`Cancel this session with ${s.studentName}? They will see it as cancelled.`)) return;
-        if (await act(() => api(`/tutor/slots/${s.id}`, { method: 'DELETE' }), s.studentName ? 'Session cancelled.' : 'Time slot removed.')) reload();
-      },
-    }, s.studentName ? 'Cancel session' : 'Remove')));
+    h('div', { className: 'actions' },
+      h('button', {
+        className: 'btn secondary',
+        onclick: () => editMessage({
+          context: when(s),
+          label: TUTOR_MESSAGE_LABEL,
+          value: s.tutorNote,
+          save: (tutorNote) => api(`/tutor/slots/${s.id}/note`, { method: 'PUT', body: { tutorNote } }),
+          reload,
+        }),
+      }, s.tutorNote ? 'Edit message' : 'Add message'),
+      h('button', {
+        className: 'btn secondary',
+        onclick: async () => {
+          if (s.studentName && !window.confirm(`Cancel this session with ${s.studentName}? They will see it as cancelled.`)) return;
+          if (await act(() => api(`/tutor/slots/${s.id}`, { method: 'DELETE' }), s.studentName ? 'Session cancelled.' : 'Time slot removed.')) reload();
+        },
+      }, s.studentName ? 'Cancel session' : 'Remove')));
 }
 
 async function tutorPage() {
@@ -723,7 +767,7 @@ async function tutorPage() {
         h('section', { className: 'card' }, h('h2', {}, 'Courses I teach'), chips, h('p', {}), search, results),
         h('section', { className: 'card' }, h('h2', {}, 'Add a time slot'),
           h('form', { onsubmit: submitter(async (values, form) => {
-            const fields = { location: values.location, repeatWeeks: Number(values.repeatWeeks), ...rangeFrom(values) };
+            const fields = { location: values.location, tutorNote: values.tutorNote, repeatWeeks: Number(values.repeatWeeks), ...rangeFrom(values) };
             const res = await api('/tutor/slots', { method: 'POST', body: withFile(fields, values.file) });
             form.reset();
             toast(res.fileError ?? 'Time slot added.');
@@ -731,6 +775,7 @@ async function tutorPage() {
           }) },
           timeFields(),
           field('Location', h('input', { type: 'text', name: 'location', required: true, maxLength: 120, placeholder: 'Learning Commons or a Zoom link' })),
+          field(TUTOR_MESSAGE_LABEL, h('textarea', { name: 'tutorNote', maxLength: 500, placeholder: 'e.g. Recursion, midterm review, debugging your code' })),
           field('Repeat weekly for', h('select', { name: 'repeatWeeks' }, [1, 2, 4, 8, 10].map((n) => h('option', { value: n }, n === 1 ? 'Just this once' : `${n} weeks`)))),
           fileField(),
           h('button', { className: 'btn', type: 'submit' }, 'Add time slot')))),
