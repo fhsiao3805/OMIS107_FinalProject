@@ -167,3 +167,8 @@ dialog::backdrop { background: rgb(30 20 20 / .45); }
   .session { align-items: stretch; flex-direction: column; }
   .session .actions { justify-content: flex-end; }
 }
+
+/* The file shared in a session or group */
+.shared-file { align-items: center; display: flex; flex-wrap: wrap; gap: 6px 10px; margin-top: 8px; }
+.shared-file a { font-weight: 600; overflow-wrap: anywhere; }
+.shared-file .btn { font-size: .8rem; padding: 3px 10px; }

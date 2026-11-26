@@ -16,10 +16,11 @@ const view = document.getElementById('view');
 const SELECTED_KEY = 'studyhub.selectedCourses';
 
 async function api(path, { method = 'GET', body } = {}) {
+  const upload = body instanceof FormData; // files go as a form, everything else as JSON
   const res = await fetch(`/api${path}`, {
     method,
-    headers: body ? { 'Content-Type': 'application/json' } : {},
-    body: body ? JSON.stringify(body) : undefined,
+    headers: body && !upload ? { 'Content-Type': 'application/json' } : {},
+    body: upload ? body : body ? JSON.stringify(body) : undefined,
   });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(data.error ?? 'Something went wrong.');
@@ -91,6 +92,55 @@ const majorOptions = (selected, placeholder) => [
 const dialogButtons = (close, label) => h('div', { className: 'dialog-actions' },
   h('button', { type: 'button', className: 'btn secondary', onclick: close }, 'Cancel'),
   h('button', { type: 'submit', className: 'btn' }, label));
+
+const MAX_FILE_BYTES = 5 * 1024 * 1024;
+const FILE_TYPES = 'application/pdf,image/png,image/jpeg,image/gif,image/webp';
+
+/** A shared file in a tutoring session or study group, under `label` (e.g. "Your file").
+ *  `path` is its API path, e.g. /slots/12/attachment. With `canEdit`, it can be shared, replaced or
+ *  removed here; otherwise it can only be opened. */
+function sharedFile(path, name, reload, { label, canEdit }) {
+  if (!canEdit) {
+    return h('div', { className: 'shared-file' }, h('span', { className: 'muted small' }, `${label}:`),
+      name ? h('a', { href: `/api${path}`, download: name }, name) : h('span', { className: 'muted small' }, 'none shared yet'));
+  }
+  const picker = h('input', {
+    type: 'file', accept: FILE_TYPES, hidden: true, ariaLabel: 'Choose a PDF or image to share',
+    onchange: async () => {
+      const file = picker.files[0];
+      picker.value = '';
+      if (!file) return;
+      if (file.size > MAX_FILE_BYTES) { toast('Files can be at most 5 MB.'); return; }
+      const body = new FormData();
+      body.append('file', file);
+      if (await act(() => api(path, { method: 'PUT', body }), 'File shared.')) reload();
+    },
+  });
+  const button = (text, onclick) => h('button', { type: 'button', className: 'btn secondary', onclick }, text);
+  return h('div', { className: 'shared-file' },
+    h('span', { className: 'muted small' }, `${label}:`),
+    name ? h('a', { href: `/api${path}`, download: name }, name) : h('span', { className: 'muted small' }, 'none yet (PDF or image, up to 5 MB)'),
+    picker,
+    button(name ? 'Replace' : 'Share a file', () => picker.click()),
+    name && button('Remove', async () => {
+      if (!window.confirm(`Remove ${name}? No one will be able to open it anymore.`)) return;
+      if (await act(() => api(path, { method: 'DELETE' }), 'File removed.')) reload();
+    }));
+}
+
+/** An optional file input for forms that create a time slot, booking or study group. */
+const fileField = () => field('Share a file (optional): a PDF or image up to 5 MB',
+  h('input', { type: 'file', name: 'file', accept: FILE_TYPES }));
+
+/** The request body for a form with an optional file: plain JSON, or a form carrying the fields as JSON plus the file. */
+function withFile(fields, file) {
+  if (!file || !file.size) return fields;
+  if (file.size > MAX_FILE_BYTES) throw new Error('Files can be at most 5 MB.');
+  const body = new FormData();
+  body.append('data', JSON.stringify(fields));
+  body.append('file', file);
+  return body;
+}
 
 /** Local date + time inputs become an absolute instant, so everyone sees the right time. */
 function rangeFrom({ date, start, end }) {
@@ -367,25 +417,26 @@ async function findPage() {
   const refresh = () => { renderRight(); loadCourses(true); };
 
   function bookSlot(slot, courses) {
-    modal('Book this time', (close) => h('form', { onsubmit: submitter(async ({ courseId, note }) => {
-      await api(`/slots/${slot.id}/book`, { method: 'POST', body: { courseId, note } });
+    modal('Book this time', (close) => h('form', { onsubmit: submitter(async ({ courseId, note, file }) => {
+      const res = await api(`/slots/${slot.id}/book`, { method: 'POST', body: withFile({ courseId, note }, file) });
       close();
-      toast('Booked. It is on your schedule now.');
+      toast(res.fileError ?? 'Booked. It is on your schedule now.');
       refresh();
     }) },
     h('p', {}, `${when(slot)} with ${slot.tutorName}`),
     h('p', { className: 'muted small' }, slot.location),
     field('Course', h('select', { name: 'courseId', required: true }, courses.map((c) => h('option', { value: c.id }, `${courseCode(c)} ${c.title}`)))),
     field('What do you need help with? (optional)', h('textarea', { name: 'note', maxLength: 500 })),
+    fileField(),
     dialogButtons(close, 'Confirm booking')));
   }
 
   function createGroup(selected) {
     if (!state.user) return needLogin();
-    modal('Create a study group', (close) => h('form', { onsubmit: submitter(async (values) => {
-      await api('/groups', { method: 'POST', body: { ...values, ...rangeFrom(values) } });
+    modal('Create a study group', (close) => h('form', { onsubmit: submitter(async ({ file, ...values }) => {
+      const res = await api('/groups', { method: 'POST', body: withFile({ ...values, ...rangeFrom(values) }, file) });
       close();
-      toast('Study group created.');
+      toast(res.fileError ?? 'Study group created.');
       refresh();
     }) },
     field('Course', h('select', { name: 'courseId', required: true }, selected.map((c) => h('option', { value: c.id }, `${courseCode(c)} ${c.title}`)))),
@@ -393,6 +444,7 @@ async function findPage() {
     timeFields(),
     field('Location', h('input', { type: 'text', name: 'location', required: true, maxLength: 120, placeholder: 'Learning Commons, 2nd floor' })),
     field('Maximum group size', h('input', { type: 'number', name: 'capacity', required: true, min: 2, max: 30, value: 6 })),
+    fileField(),
     dialogButtons(close, 'Create group')));
   }
 
@@ -541,7 +593,9 @@ async function schedulePage() {
       h('h3', {}, `${b.subject} ${b.number} with ${b.tutorName}`),
       h('p', {}, when(b)),
       h('p', { className: 'muted' }, `${b.location} · ${b.tutorEmail}`),
-      b.cancelledAt && h('span', { className: 'badge warn' }, 'Cancelled by tutor')),
+      b.cancelledAt && h('span', { className: 'badge warn' }, 'Cancelled by tutor'),
+      sharedFile(`/slots/${b.slotId}/attachment`, b.tutorFileName, reload, { label: "Tutor's file", canEdit: false }),
+      sharedFile(`/slots/${b.slotId}/booking/attachment`, b.studentFileName, reload, { label: 'Your file', canEdit: true })),
     !b.cancelledAt && h('div', { className: 'actions' }, h('button', {
       className: 'btn secondary',
       onclick: async () => { if (await act(() => api(`/slots/${b.slotId}/book`, { method: 'DELETE' }), 'Booking cancelled.')) reload(); },
@@ -552,7 +606,8 @@ async function schedulePage() {
       h('h3', {}, `${g.subject} ${g.number}: ${g.topic}`),
       h('p', {}, when(g)),
       h('p', { className: 'muted' }, `${g.location} · ${g.members.length} of ${g.capacity} joined`),
-      h('p', { className: 'muted small' }, g.members.map((m) => `${m.name} (${m.email})`).join(', '))),
+      h('p', { className: 'muted small' }, g.members.map((m) => `${m.name} (${m.email})`).join(', ')),
+      sharedFile(`/groups/${g.id}/attachment`, g.attachmentName, reload, { label: 'Group file', canEdit: g.isCreator })),
     h('div', { className: 'actions' }, h('button', {
       className: 'btn secondary',
       onclick: async () => {
@@ -622,7 +677,9 @@ async function tutorPage() {
       h('p', { className: 'muted' }, s.location),
       s.studentName
         ? [h('p', {}, `Booked by ${s.studentName} (${s.studentEmail}) for ${s.subject} ${s.number}`), s.note && h('p', { className: 'muted small' }, `"${s.note}"`)]
-        : h('span', { className: 'badge' }, 'Open')),
+        : h('span', { className: 'badge' }, 'Open'),
+      sharedFile(`/slots/${s.id}/attachment`, s.tutorFileName, tutorPage, { label: 'Your file', canEdit: true }),
+      s.studentName && sharedFile(`/slots/${s.id}/booking/attachment`, s.studentFileName, tutorPage, { label: "Student's file", canEdit: false })),
     h('div', { className: 'actions' }, h('button', {
       className: 'btn secondary',
       onclick: async () => {
@@ -638,14 +695,16 @@ async function tutorPage() {
         h('section', { className: 'card' }, h('h2', {}, 'Courses I teach'), chips, h('p', {}), search, results),
         h('section', { className: 'card' }, h('h2', {}, 'Add a time slot'),
           h('form', { onsubmit: submitter(async (values, form) => {
-            await api('/tutor/slots', { method: 'POST', body: { location: values.location, repeatWeeks: Number(values.repeatWeeks), ...rangeFrom(values) } });
+            const fields = { location: values.location, repeatWeeks: Number(values.repeatWeeks), ...rangeFrom(values) };
+            const res = await api('/tutor/slots', { method: 'POST', body: withFile(fields, values.file) });
             form.reset();
-            toast('Time slot added.');
+            toast(res.fileError ?? 'Time slot added.');
             tutorPage();
           }) },
           timeFields(),
           field('Location', h('input', { type: 'text', name: 'location', required: true, maxLength: 120, placeholder: 'Learning Commons or a Zoom link' })),
           field('Repeat weekly for', h('select', { name: 'repeatWeeks' }, [1, 2, 4, 8, 10].map((n) => h('option', { value: n }, n === 1 ? 'Just this once' : `${n} weeks`)))),
+          fileField(),
           h('button', { className: 'btn', type: 'submit' }, 'Add time slot')))),
       h('section', {}, h('h2', {}, 'Upcoming time slots'), h('div', { className: 'listing' },
         slotCards.length ? slotCards : h('div', { className: 'empty' }, 'No upcoming time slots. Add one to start getting bookings.')))),
