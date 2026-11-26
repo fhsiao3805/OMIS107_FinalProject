@@ -9,14 +9,16 @@ import threading
 import time
 from datetime import datetime, timedelta, timezone
 from functools import wraps
+from io import BytesIO
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import click
 import psycopg
-from flask import Flask, g, jsonify, render_template, request
-from werkzeug.exceptions import HTTPException
+from flask import Flask, g, jsonify, render_template, request, send_file
+from werkzeug.exceptions import HTTPException, RequestEntityTooLarge
 
+import attachments
 import auth
 from auth import HttpError
 from crawler.crawl import PageCache, acquire_crawl_lock, crawl_bulletin
@@ -114,10 +116,12 @@ def rows(cursor):
 # ---- Application ----
 
 
-def create_app(data_dir=None, clock=None, secure_cookies=None, database_url=None):
-    """Builds the app. The database comes from DATABASE_URL unless `database_url` is given."""
+def create_app(data_dir=None, clock=None, secure_cookies=None, database_url=None, attachment_storage=None):
+    """Builds the app. The database comes from DATABASE_URL unless `database_url` is given, and
+    shared files go to the ATTACHMENTS_BUCKET bucket unless `attachment_storage` is given."""
     base = Path(data_dir or os.environ.get("DATA_DIR") or Path(__file__).parent / "data")
     db_url = database_url or database.database_url()
+    storage = attachment_storage or attachments.storage_from_env()
     database.init_database(db_url)
     now = clock or (lambda: datetime.now(timezone.utc))
 
@@ -481,7 +485,7 @@ def create_app(data_dir=None, clock=None, secure_cookies=None, database_url=None
     def tutor_slots():
         return jsonify(slots=rows(get_db().execute(
             """SELECT s.id, s.starts_at AS "startsAt", s.ends_at AS "endsAt", s.location, b.note,
-                 st.name AS "studentName", st.email AS "studentEmail", c.subject, c.number, c.title
+                 b.attachment_name AS "attachmentName", st.name AS "studentName", st.email AS "studentEmail", c.subject, c.number, c.title
                FROM tutor_slots s
                LEFT JOIN bookings b ON b.slot_id = s.id
                LEFT JOIN users st ON st.id = b.student_id
@@ -566,9 +570,13 @@ def create_app(data_dir=None, clock=None, secure_cookies=None, database_url=None
     @app.delete("/api/slots/<int:slot_id>/book")
     @student
     def cancel_booking(slot_id):
-        deleted = get_db().execute("DELETE FROM bookings WHERE slot_id = %s AND student_id = %s", (slot_id, g.user["id"])).rowcount
-        if not deleted:
+        deleted = get_db().execute(
+            "DELETE FROM bookings WHERE slot_id = %s AND student_id = %s RETURNING id, attachment_name", (slot_id, g.user["id"])
+        ).fetchone()
+        if deleted is None:
             raise HttpError(404, "Booking not found.")
+        if deleted["attachment_name"]:
+            discard_file(attachments.booking_key(deleted["id"]))
         return jsonify(ok=True)
 
     # ---- Students: study groups ----
@@ -632,9 +640,13 @@ def create_app(data_dir=None, clock=None, secure_cookies=None, database_url=None
     @app.delete("/api/groups/<int:group_id>")
     @student
     def delete_group(group_id):
-        deleted = get_db().execute("DELETE FROM study_groups WHERE id = %s AND creator_id = %s", (group_id, g.user["id"])).rowcount
-        if not deleted:
+        deleted = get_db().execute(
+            "DELETE FROM study_groups WHERE id = %s AND creator_id = %s RETURNING attachment_name", (group_id, g.user["id"])
+        ).fetchone()
+        if deleted is None:
             raise HttpError(404, "Study group not found.")
+        if deleted["attachment_name"]:
+            discard_file(attachments.group_key(group_id))
         return jsonify(ok=True)
 
     @app.get("/api/me/schedule")
@@ -644,7 +656,7 @@ def create_app(data_dir=None, clock=None, secure_cookies=None, database_url=None
         stamp = now_iso()
         bookings = rows(db.execute(
             """SELECT s.id AS "slotId", s.starts_at AS "startsAt", s.ends_at AS "endsAt", s.location, s.cancelled_at AS "cancelledAt", b.note,
-                 u.name AS "tutorName", u.email AS "tutorEmail", c.subject, c.number, c.title
+                 b.attachment_name AS "attachmentName", u.name AS "tutorName", u.email AS "tutorEmail", c.subject, c.number, c.title
                FROM bookings b
                JOIN tutor_slots s ON s.id = b.slot_id
                JOIN users u ON u.id = s.tutor_id
@@ -654,7 +666,7 @@ def create_app(data_dir=None, clock=None, secure_cookies=None, database_url=None
         ))
         groups = rows(db.execute(
             """SELECT g.id, g.topic, g.starts_at AS "startsAt", g.ends_at AS "endsAt", g.location, g.capacity,
-                 g.creator_id = %(me)s AS "isCreator", c.subject, c.number, c.title
+                 g.creator_id = %(me)s AS "isCreator", g.attachment_name AS "attachmentName", c.subject, c.number, c.title
                FROM study_group_members m
                JOIN study_groups g ON g.id = m.group_id
                JOIN courses c ON c.id = g.course_id
@@ -669,6 +681,138 @@ def create_app(data_dir=None, clock=None, secure_cookies=None, database_url=None
                 (group["id"],),
             ))
         return jsonify(bookings=bookings, groups=groups)
+
+    # ---- Shared files ----
+    # One PDF or image per tutoring session (a booked slot) or study group. Only the session's
+    # tutor and student, or the group's members, can attach, open or remove it.
+
+    def require_storage():
+        if storage is None:
+            raise HttpError(503, "File sharing isn't set up on this server.")
+        return storage
+
+    def discard_file(key):
+        """Removes a stored file after its session or group is gone. A failure only leaves an unreachable file."""
+        if storage is not None:
+            try:
+                storage.delete(key)
+            except Exception:
+                log.exception("Could not delete shared file %s", key)
+
+    def locked_booking(db, slot_id):
+        """The booking on a slot the current user tutors or booked, locked until the transaction ends."""
+        booking = db.execute(
+            """SELECT b.id, b.attachment_name FROM bookings b JOIN tutor_slots s ON s.id = b.slot_id
+               WHERE b.slot_id = %s AND (b.student_id = %s OR s.tutor_id = %s) FOR UPDATE OF b""",
+            (slot_id, g.user["id"], g.user["id"]),
+        ).fetchone()
+        if booking is None:
+            raise HttpError(404, "Tutoring session not found.")
+        return booking
+
+    def locked_group(db, group_id):
+        """A study group the current user belongs to, locked until the transaction ends."""
+        group = db.execute(
+            """SELECT g.id, g.attachment_name FROM study_groups g
+               WHERE g.id = %s AND EXISTS (SELECT 1 FROM study_group_members m WHERE m.group_id = g.id AND m.user_id = %s)
+               FOR UPDATE OF g""",
+            (group_id, g.user["id"]),
+        ).fetchone()
+        if group is None:
+            raise HttpError(404, "Study group not found.")
+        return group
+
+    def uploaded_file():
+        """The uploaded file's bytes, content type and cleaned name, or a 400/413 explaining what is wrong."""
+        too_large = HttpError(413, "Files can be at most 5 MB.")
+        limit = attachments.MAX_BYTES + 64 * 1024  # room for the multipart form around the file
+        if (request.content_length or 0) > limit:
+            raise too_large
+        request.max_content_length = limit
+        try:
+            upload = request.files.get("file")
+        except RequestEntityTooLarge as err:
+            raise too_large from err
+        if upload is None:
+            raise HttpError(400, "Choose a file to attach.")
+        data = upload.read(attachments.MAX_BYTES + 1)
+        if len(data) > attachments.MAX_BYTES:
+            raise too_large
+        if not data:
+            raise HttpError(400, "That file is empty.")
+        content_type = attachments.detect_type(data)
+        if content_type is None:
+            raise HttpError(400, "Attach a PDF or an image (PNG, JPEG, GIF or WebP).")
+        return data, content_type, attachments.clean_name(upload.filename, content_type)
+
+    def attach(locate, key_for, table, item_id):
+        files = require_storage()
+        db = get_db()
+        with db.transaction():
+            locate(db, item_id)  # refuse outsiders before reading their upload
+        data, content_type, name = uploaded_file()
+        # The row lock makes uploads to the same session take turns, so the stored name always matches the file.
+        with db.transaction():
+            row = locate(db, item_id)
+            files.put(key_for(row["id"]), data, content_type)
+            db.execute(f"UPDATE {table} SET attachment_name = %s WHERE id = %s", (name, row["id"]))
+        return jsonify(attachmentName=name)
+
+    def open_file(locate, key_for, item_id):
+        files = require_storage()
+        db = get_db()
+        with db.transaction():
+            row = locate(db, item_id)
+        data = files.get(key_for(row["id"])) if row["attachment_name"] else None
+        if data is None:
+            raise HttpError(404, "No file is attached.")
+        response = send_file(
+            BytesIO(data), mimetype=attachments.detect_type(data) or "application/octet-stream",
+            as_attachment=True, download_name=row["attachment_name"], max_age=0,
+        )
+        response.headers["Cache-Control"] = "private, no-store"
+        return response
+
+    def remove_file(locate, key_for, table, item_id):
+        files = require_storage()
+        db = get_db()
+        with db.transaction():
+            row = locate(db, item_id)
+            if not row["attachment_name"]:
+                raise HttpError(404, "No file is attached.")
+            files.delete(key_for(row["id"]))
+            db.execute(f"UPDATE {table} SET attachment_name = NULL WHERE id = %s", (row["id"],))
+        return jsonify(ok=True)
+
+    @app.put("/api/slots/<int:slot_id>/attachment")
+    @signed_in
+    def attach_to_session(slot_id):
+        return attach(locked_booking, attachments.booking_key, "bookings", slot_id)
+
+    @app.get("/api/slots/<int:slot_id>/attachment")
+    @signed_in
+    def open_session_file(slot_id):
+        return open_file(locked_booking, attachments.booking_key, slot_id)
+
+    @app.delete("/api/slots/<int:slot_id>/attachment")
+    @signed_in
+    def remove_session_file(slot_id):
+        return remove_file(locked_booking, attachments.booking_key, "bookings", slot_id)
+
+    @app.put("/api/groups/<int:group_id>/attachment")
+    @signed_in
+    def attach_to_group(group_id):
+        return attach(locked_group, attachments.group_key, "study_groups", group_id)
+
+    @app.get("/api/groups/<int:group_id>/attachment")
+    @signed_in
+    def open_group_file(group_id):
+        return open_file(locked_group, attachments.group_key, group_id)
+
+    @app.delete("/api/groups/<int:group_id>/attachment")
+    @signed_in
+    def remove_group_file(group_id):
+        return remove_file(locked_group, attachments.group_key, "study_groups", group_id)
 
     # ---- Command line: `flask crawl` and `flask import-catalog` ----
 

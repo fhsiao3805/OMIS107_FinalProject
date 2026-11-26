@@ -16,10 +16,11 @@ const view = document.getElementById('view');
 const SELECTED_KEY = 'studyhub.selectedCourses';
 
 async function api(path, { method = 'GET', body } = {}) {
+  const upload = body instanceof FormData; // files go as a form, everything else as JSON
   const res = await fetch(`/api${path}`, {
     method,
-    headers: body ? { 'Content-Type': 'application/json' } : {},
-    body: body ? JSON.stringify(body) : undefined,
+    headers: body && !upload ? { 'Content-Type': 'application/json' } : {},
+    body: upload ? body : body ? JSON.stringify(body) : undefined,
   });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(data.error ?? 'Something went wrong.');
@@ -91,6 +92,37 @@ const majorOptions = (selected, placeholder) => [
 const dialogButtons = (close, label) => h('div', { className: 'dialog-actions' },
   h('button', { type: 'button', className: 'btn secondary', onclick: close }, 'Cancel'),
   h('button', { type: 'submit', className: 'btn' }, label));
+
+const MAX_FILE_BYTES = 5 * 1024 * 1024;
+const FILE_TYPES = 'application/pdf,image/png,image/jpeg,image/gif,image/webp';
+
+/** The file shared in a tutoring session or study group: open it, attach one, replace it or remove it.
+ *  `path` is the API path of the attachment, e.g. /slots/12/attachment. */
+function sharedFile(path, name, reload) {
+  const picker = h('input', {
+    type: 'file', accept: FILE_TYPES, hidden: true, ariaLabel: 'Choose a PDF or image to share',
+    onchange: async () => {
+      const file = picker.files[0];
+      picker.value = '';
+      if (!file) return;
+      if (file.size > MAX_FILE_BYTES) { toast('Files can be at most 5 MB.'); return; }
+      const body = new FormData();
+      body.append('file', file);
+      if (await act(() => api(path, { method: 'PUT', body }), 'File shared.')) reload();
+    },
+  });
+  const button = (label, onclick) => h('button', { type: 'button', className: 'btn secondary', onclick }, label);
+  return h('div', { className: 'shared-file' },
+    name
+      ? [h('span', { className: 'muted small' }, 'Shared file:'), h('a', { href: `/api${path}`, download: name }, name)]
+      : h('span', { className: 'muted small' }, 'No shared file yet. PDFs and images up to 5 MB.'),
+    picker,
+    button(name ? 'Replace' : 'Share a file', () => picker.click()),
+    name && button('Remove', async () => {
+      if (!window.confirm(`Remove ${name} for everyone in this session?`)) return;
+      if (await act(() => api(path, { method: 'DELETE' }), 'File removed.')) reload();
+    }));
+}
 
 /** Local date + time inputs become an absolute instant, so everyone sees the right time. */
 function rangeFrom({ date, start, end }) {
@@ -541,7 +573,8 @@ async function schedulePage() {
       h('h3', {}, `${b.subject} ${b.number} with ${b.tutorName}`),
       h('p', {}, when(b)),
       h('p', { className: 'muted' }, `${b.location} · ${b.tutorEmail}`),
-      b.cancelledAt && h('span', { className: 'badge warn' }, 'Cancelled by tutor')),
+      b.cancelledAt && h('span', { className: 'badge warn' }, 'Cancelled by tutor'),
+      sharedFile(`/slots/${b.slotId}/attachment`, b.attachmentName, reload)),
     !b.cancelledAt && h('div', { className: 'actions' }, h('button', {
       className: 'btn secondary',
       onclick: async () => { if (await act(() => api(`/slots/${b.slotId}/book`, { method: 'DELETE' }), 'Booking cancelled.')) reload(); },
@@ -552,7 +585,8 @@ async function schedulePage() {
       h('h3', {}, `${g.subject} ${g.number}: ${g.topic}`),
       h('p', {}, when(g)),
       h('p', { className: 'muted' }, `${g.location} · ${g.members.length} of ${g.capacity} joined`),
-      h('p', { className: 'muted small' }, g.members.map((m) => `${m.name} (${m.email})`).join(', '))),
+      h('p', { className: 'muted small' }, g.members.map((m) => `${m.name} (${m.email})`).join(', ')),
+      sharedFile(`/groups/${g.id}/attachment`, g.attachmentName, reload)),
     h('div', { className: 'actions' }, h('button', {
       className: 'btn secondary',
       onclick: async () => {
@@ -621,7 +655,8 @@ async function tutorPage() {
       h('h3', {}, when(s)),
       h('p', { className: 'muted' }, s.location),
       s.studentName
-        ? [h('p', {}, `Booked by ${s.studentName} (${s.studentEmail}) for ${s.subject} ${s.number}`), s.note && h('p', { className: 'muted small' }, `"${s.note}"`)]
+        ? [h('p', {}, `Booked by ${s.studentName} (${s.studentEmail}) for ${s.subject} ${s.number}`), s.note && h('p', { className: 'muted small' }, `"${s.note}"`),
+          sharedFile(`/slots/${s.id}/attachment`, s.attachmentName, tutorPage)]
         : h('span', { className: 'badge' }, 'Open')),
     h('div', { className: 'actions' }, h('button', {
       className: 'btn secondary',

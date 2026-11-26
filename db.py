@@ -108,6 +108,9 @@ TABLES = [
 ADDED_COLUMNS = {
     "users": {"student_enabled": "INTEGER NOT NULL DEFAULT 0"},
     "sessions": {"active_role": "TEXT CHECK (active_role IN ('student', 'tutor'))"},
+    # The name of the file shared in a tutoring session or study group; the file is in Cloud Storage.
+    "bookings": {"attachment_name": "TEXT"},
+    "study_groups": {"attachment_name": "TEXT"},
 }
 
 

@@ -17,8 +17,10 @@ load_dotenv()
 TEST_URL = os.environ.get("TEST_DATABASE_URL", "").strip()
 # Read only to compare against, never to connect to.
 APP_URL = (os.environ.get("DATABASE_URL") or dotenv_values().get("DATABASE_URL") or "").strip()
-# Blank, not removed, so a later load_dotenv() can't bring the real value back.
+# Blank, not removed, so a later load_dotenv() can't bring the real values back.
+# Tests never reach the real database or the real file bucket.
 os.environ["DATABASE_URL"] = ""
+os.environ["ATTACHMENTS_BUCKET"] = ""
 
 ALL_TABLES = sql.SQL(", ").join(map(sql.Identifier, database.TABLES))
 
