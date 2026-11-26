@@ -202,6 +202,28 @@ def test_dual_user_schedule_spans_both_roles(app):
     assert t.post("/tutor/slots", {**span(50), "location": "L"}).status_code == 201
 
 
+def test_tutor_schedule_shows_only_held_sessions(app):
+    t, slot_id = dual_user(app, 24)  # in the student view
+    booker = User(app, "student")
+    booker.post(f"/slots/{slot_id}/book", {"courseId": 1, "note": "recursion"})
+    group_id = User(app, "student").post("/groups", group_body(30)).json["id"]
+    assert t.post(f"/groups/{group_id}/join").status_code == 201
+    assert [g["id"] for g in t.get("/me/schedule").json["groups"]] == [group_id]
+
+    t.post("/me/role", {"role": "tutor"})
+    schedule = t.get("/me/schedule").json
+    assert set(schedule) == {"slots"}
+    assert [(s["id"], s["studentEmail"], s["note"]) for s in schedule["slots"]] == [(slot_id, booker.email, "recursion")]
+    assert "slots" not in booker.get("/me/schedule").json
+
+
+def test_tutor_only_schedule_lists_slots(app):
+    tutor, slot_id = tutor_with_slot(app)
+    schedule = tutor.get("/me/schedule").json
+    assert set(schedule) == {"slots"}
+    assert [s["id"] for s in schedule["slots"]] == [slot_id]
+
+
 def test_existing_database_gains_new_columns(database_url, drop_tables_after):
     old = database.connect(database_url)
     old.execute(
@@ -271,6 +293,21 @@ def test_slot_booked_once_and_only_for_offered_course(app):
     view = tutor.get("/tutor/slots").json["slots"][0]
     assert view["studentEmail"] == a.email
     assert view["note"] == "recursion"
+
+
+def test_student_edits_booking_note(app):
+    tutor, slot_id = tutor_with_slot(app)
+    s = User(app, "student")
+    s.post(f"/slots/{slot_id}/book", {"courseId": 1, "note": "recursion"})
+    assert s.put(f"/slots/{slot_id}/book/note", {"note": "  linked lists  "}).json["note"] == "linked lists"
+    assert s.get("/me/schedule").json["bookings"][0]["note"] == "linked lists"
+    assert tutor.get("/tutor/slots").json["slots"][0]["note"] == "linked lists"
+    assert s.put(f"/slots/{slot_id}/book/note", {"note": "x" * 501}).status_code == 400
+    assert User(app, "student").put(f"/slots/{slot_id}/book/note", {"note": "mine"}).status_code == 404
+    assert tutor.put(f"/slots/{slot_id}/book/note", {"note": "mine"}).status_code == 403
+
+    tutor.delete(f"/tutor/slots/{slot_id}")
+    assert s.put(f"/slots/{slot_id}/book/note", {"note": "too late"}).status_code == 404
 
 
 def test_concurrent_booking_has_one_winner(app):
