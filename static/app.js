@@ -167,7 +167,8 @@ function renderNav() {
     link('/home', 'Find help'),
     ...(u
       ? [
-        u.role === 'tutor' ? link('#/tutor', 'Tutor dashboard') : link('#/schedule', 'My schedule'),
+        ...(u.role === 'tutor' ? [link('#/tutor', 'Tutor dashboard')] : []),
+        link('#/schedule', 'My schedule'),
         link('#/profile', 'Profile'),
         ...(u.roles.length > 1
           ? [u.role === 'tutor'
@@ -584,9 +585,11 @@ function profilePage() {
 
 // ---- Student schedule ----
 
+/** Students see the sessions they booked and their study groups; tutors see the sessions they hold. */
 async function schedulePage() {
-  const { bookings, groups } = await api('/me/schedule');
+  const { bookings = [], slots = [], groups = [] } = await api('/me/schedule');
   const reload = () => schedulePage();
+  const asTutor = state.user.role === 'tutor';
 
   function editNote(b) {
     modal('Edit your message', (close) => h('form', { onsubmit: submitter(async ({ note }) => {
@@ -631,17 +634,42 @@ async function schedulePage() {
       },
     }, g.isCreator ? 'Cancel group' : 'Leave'))));
 
+  const sessionCards = asTutor ? slots.map((s) => tutorSlotCard(s, reload)) : bookingCards;
+  const noSessions = asTutor
+    ? h('div', { className: 'empty' }, 'No upcoming time slots. ', h('a', { href: '#/tutor' }, 'Add one on your dashboard'))
+    : h('div', { className: 'empty' }, 'No tutoring booked. ', h('a', { href: '/home' }, 'Find a tutor'));
+
   view.replaceChildren(
     h('div', { className: 'intro' }, h('h1', {}, 'My schedule')),
     h('div', { className: 'stack' },
-      h('section', {}, h('h2', {}, 'Tutoring sessions'), h('div', { className: 'listing' },
-        bookingCards.length ? bookingCards : h('div', { className: 'empty' }, 'No tutoring booked. ', h('a', { href: '/home' }, 'Find a tutor')))),
-      h('section', {}, h('h2', {}, 'Study groups'), h('div', { className: 'listing' },
+      h('section', {}, h('h2', {}, asTutor ? 'Tutoring Sessions I Hold' : 'Tutoring sessions'),
+        h('div', { className: 'listing' }, sessionCards.length ? sessionCards : noSessions)),
+      !asTutor && h('section', {}, h('h2', {}, 'Study groups'), h('div', { className: 'listing' },
         groupItems.length ? groupItems : h('div', { className: 'empty' }, 'You are not in any study groups. ', h('a', { href: '/home' }, 'Find one'))))),
   );
 }
 
 // ---- Tutor dashboard ----
+
+/** One of the tutor's own time slots: who booked it, the shared files, and a button to cancel it. */
+function tutorSlotCard(s, reload) {
+  return h('article', { className: 'session' },
+    h('div', {},
+      h('h3', {}, when(s)),
+      h('p', { className: 'muted' }, s.location),
+      s.studentName
+        ? [h('p', {}, `Booked by ${s.studentName} (${s.studentEmail}) for ${s.subject} ${s.number}`), s.note && h('p', { className: 'muted small' }, `"${s.note}"`)]
+        : h('span', { className: 'badge' }, 'Open'),
+      sharedFile(`/slots/${s.id}/attachment`, s.tutorFileName, reload, { label: 'Your file', canEdit: true }),
+      s.studentName && sharedFile(`/slots/${s.id}/booking/attachment`, s.studentFileName, reload, { label: "Student's file", canEdit: false })),
+    h('div', { className: 'actions' }, h('button', {
+      className: 'btn secondary',
+      onclick: async () => {
+        if (s.studentName && !window.confirm(`Cancel this session with ${s.studentName}? They will see it as cancelled.`)) return;
+        if (await act(() => api(`/tutor/slots/${s.id}`, { method: 'DELETE' }), s.studentName ? 'Session cancelled.' : 'Time slot removed.')) reload();
+      },
+    }, s.studentName ? 'Cancel session' : 'Remove')));
+}
 
 async function tutorPage() {
   const [{ courses }, { slots }] = await Promise.all([api('/tutor/courses'), api('/tutor/slots')]);
@@ -686,22 +714,7 @@ async function tutorPage() {
   });
   renderChips();
 
-  const slotCards = slots.map((s) => h('article', { className: 'session' },
-    h('div', {},
-      h('h3', {}, when(s)),
-      h('p', { className: 'muted' }, s.location),
-      s.studentName
-        ? [h('p', {}, `Booked by ${s.studentName} (${s.studentEmail}) for ${s.subject} ${s.number}`), s.note && h('p', { className: 'muted small' }, `"${s.note}"`)]
-        : h('span', { className: 'badge' }, 'Open'),
-      sharedFile(`/slots/${s.id}/attachment`, s.tutorFileName, tutorPage, { label: 'Your file', canEdit: true }),
-      s.studentName && sharedFile(`/slots/${s.id}/booking/attachment`, s.studentFileName, tutorPage, { label: "Student's file", canEdit: false })),
-    h('div', { className: 'actions' }, h('button', {
-      className: 'btn secondary',
-      onclick: async () => {
-        if (s.studentName && !window.confirm(`Cancel this session with ${s.studentName}? They will see it as cancelled.`)) return;
-        if (await act(() => api(`/tutor/slots/${s.id}`, { method: 'DELETE' }), s.studentName ? 'Session cancelled.' : 'Time slot removed.')) tutorPage();
-      },
-    }, s.studentName ? 'Cancel session' : 'Remove'))));
+  const slotCards = slots.map((s) => tutorSlotCard(s, tutorPage));
 
   view.replaceChildren(
     h('div', { className: 'intro' }, h('h1', {}, 'Tutor dashboard')),
@@ -736,7 +749,7 @@ async function route() {
     '#/login': loginPage,
     '#/signup': signupPage,
     '#/profile': u ? profilePage : loginPage,
-    '#/schedule': u?.role === 'student' ? schedulePage : loginPage,
+    '#/schedule': u ? schedulePage : loginPage,
     '#/tutor': u?.role === 'tutor' ? tutorPage : loginPage,
   };
   renderNav();

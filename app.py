@@ -484,7 +484,11 @@ def create_app(data_dir=None, clock=None, secure_cookies=None, database_url=None
     @app.get("/api/tutor/slots")
     @tutor
     def tutor_slots():
-        return jsonify(slots=rows(get_db().execute(
+        return jsonify(slots=tutor_upcoming_slots(get_db(), now_iso()))
+
+    def tutor_upcoming_slots(db, stamp):
+        """The tutor's upcoming, uncancelled slots, with the booking on each one that has been booked."""
+        return rows(db.execute(
             """SELECT s.id, s.starts_at AS "startsAt", s.ends_at AS "endsAt", s.location, b.note,
                  s.attachment_name AS "tutorFileName", b.attachment_name AS "studentFileName", st.name AS "studentName", st.email AS "studentEmail", c.subject, c.number, c.title
                FROM tutor_slots s
@@ -493,8 +497,8 @@ def create_app(data_dir=None, clock=None, secure_cookies=None, database_url=None
                LEFT JOIN courses c ON c.id = b.course_id
                WHERE s.tutor_id = %s AND s.cancelled_at IS NULL AND s.ends_at > %s
                ORDER BY s.starts_at""",
-            (g.user["id"], now_iso()),
-        )))
+            (g.user["id"], stamp),
+        ))
 
     @app.post("/api/tutor/slots")
     @tutor
@@ -671,11 +675,17 @@ def create_app(data_dir=None, clock=None, secure_cookies=None, database_url=None
         return jsonify(ok=True)
 
     @app.get("/api/me/schedule")
-    @student
+    @signed_in
     def schedule():
+        """Students get the sessions they booked and their study groups; tutors get the sessions they hold."""
         db = get_db()
         stamp = now_iso()
-        bookings = rows(db.execute(
+        if g.user["role"] == "tutor":
+            return jsonify(slots=tutor_upcoming_slots(db, stamp))
+        return jsonify(bookings=student_bookings(db, stamp), groups=user_groups(db, stamp))
+
+    def student_bookings(db, stamp):
+        return rows(db.execute(
             """SELECT s.id AS "slotId", s.starts_at AS "startsAt", s.ends_at AS "endsAt", s.location, s.cancelled_at AS "cancelledAt", b.note,
                  s.attachment_name AS "tutorFileName", b.attachment_name AS "studentFileName", u.name AS "tutorName", u.email AS "tutorEmail", c.subject, c.number, c.title
                FROM bookings b
@@ -685,6 +695,8 @@ def create_app(data_dir=None, clock=None, secure_cookies=None, database_url=None
                WHERE b.student_id = %s AND s.ends_at > %s ORDER BY s.starts_at""",
             (g.user["id"], stamp),
         ))
+
+    def user_groups(db, stamp):
         groups = rows(db.execute(
             """SELECT g.id, g.topic, g.starts_at AS "startsAt", g.ends_at AS "endsAt", g.location, g.capacity,
                  g.creator_id = %(me)s AS "isCreator", g.attachment_name AS "attachmentName", c.subject, c.number, c.title
@@ -701,7 +713,7 @@ def create_app(data_dir=None, clock=None, secure_cookies=None, database_url=None
                    WHERE m.group_id = %s ORDER BY u.name""",
                 (group["id"],),
             ))
-        return jsonify(bookings=bookings, groups=groups)
+        return groups
 
     # ---- Shared files ----
     # A PDF or image of up to 5 MB, kept in Cloud Storage:
