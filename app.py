@@ -573,6 +573,21 @@ def create_app(data_dir=None, clock=None, secure_cookies=None, database_url=None
             ).fetchone()["id"]
         return jsonify(ok=True, fileError=share_new_file(upload, attachments.booking_key, "bookings", [booking_id])), 201
 
+    @app.put("/api/slots/<int:slot_id>/book/note")
+    @student
+    def update_booking_note(slot_id):
+        note = text_field(body().get("note", ""), "Note", 500, min_length=0)
+        updated = get_db().execute(
+            """UPDATE bookings b SET note = %s FROM tutor_slots s
+               WHERE s.id = b.slot_id AND b.slot_id = %s AND b.student_id = %s
+                 AND s.cancelled_at IS NULL AND s.ends_at > %s
+               RETURNING b.note""",
+            (note, slot_id, g.user["id"], now_iso()),
+        ).fetchone()
+        if updated is None:
+            raise HttpError(404, "Booking not found.")
+        return jsonify(ok=True, note=updated["note"])
+
     @app.delete("/api/slots/<int:slot_id>/book")
     @student
     def cancel_booking(slot_id):

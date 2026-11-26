@@ -273,6 +273,21 @@ def test_slot_booked_once_and_only_for_offered_course(app):
     assert view["note"] == "recursion"
 
 
+def test_student_edits_booking_note(app):
+    tutor, slot_id = tutor_with_slot(app)
+    s = User(app, "student")
+    s.post(f"/slots/{slot_id}/book", {"courseId": 1, "note": "recursion"})
+    assert s.put(f"/slots/{slot_id}/book/note", {"note": "  linked lists  "}).json["note"] == "linked lists"
+    assert s.get("/me/schedule").json["bookings"][0]["note"] == "linked lists"
+    assert tutor.get("/tutor/slots").json["slots"][0]["note"] == "linked lists"
+    assert s.put(f"/slots/{slot_id}/book/note", {"note": "x" * 501}).status_code == 400
+    assert User(app, "student").put(f"/slots/{slot_id}/book/note", {"note": "mine"}).status_code == 404
+    assert tutor.put(f"/slots/{slot_id}/book/note", {"note": "mine"}).status_code == 403
+
+    tutor.delete(f"/tutor/slots/{slot_id}")
+    assert s.put(f"/slots/{slot_id}/book/note", {"note": "too late"}).status_code == 404
+
+
 def test_concurrent_booking_has_one_winner(app):
     _, slot_id = tutor_with_slot(app)
     students = [User(app, "student") for _ in range(8)]

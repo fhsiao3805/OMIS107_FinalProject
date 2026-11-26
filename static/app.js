@@ -588,18 +588,33 @@ async function schedulePage() {
   const { bookings, groups } = await api('/me/schedule');
   const reload = () => schedulePage();
 
+  function editNote(b) {
+    modal('Edit your message', (close) => h('form', { onsubmit: submitter(async ({ note }) => {
+      await api(`/slots/${b.slotId}/book/note`, { method: 'PUT', body: { note } });
+      close();
+      toast('Message updated.');
+      reload();
+    }) },
+    h('p', {}, `${b.subject} ${b.number} with ${b.tutorName} · ${when(b)}`),
+    field('What do you need help with? (optional)', h('textarea', { name: 'note', maxLength: 500, value: b.note ?? '' })),
+    dialogButtons(close, 'Save message')));
+  }
+
   const bookingCards = bookings.map((b) => h('article', { className: 'session' },
     h('div', {},
       h('h3', {}, `${b.subject} ${b.number} with ${b.tutorName}`),
       h('p', {}, when(b)),
       h('p', { className: 'muted' }, `${b.location} · ${b.tutorEmail}`),
       b.cancelledAt && h('span', { className: 'badge warn' }, 'Cancelled by tutor'),
+      h('p', { className: 'muted small' }, b.note ? `Your message: "${b.note}"` : 'No message shared.'),
       sharedFile(`/slots/${b.slotId}/attachment`, b.tutorFileName, reload, { label: "Tutor's file", canEdit: false }),
       sharedFile(`/slots/${b.slotId}/booking/attachment`, b.studentFileName, reload, { label: 'Your file', canEdit: true })),
-    !b.cancelledAt && h('div', { className: 'actions' }, h('button', {
-      className: 'btn secondary',
-      onclick: async () => { if (await act(() => api(`/slots/${b.slotId}/book`, { method: 'DELETE' }), 'Booking cancelled.')) reload(); },
-    }, 'Cancel'))));
+    !b.cancelledAt && h('div', { className: 'actions' },
+      h('button', { className: 'btn secondary', onclick: () => editNote(b) }, b.note ? 'Edit message' : 'Add message'),
+      h('button', {
+        className: 'btn secondary',
+        onclick: async () => { if (await act(() => api(`/slots/${b.slotId}/book`, { method: 'DELETE' }), 'Booking cancelled.')) reload(); },
+      }, 'Cancel'))));
 
   const groupItems = groups.map((g) => h('article', { className: 'session' },
     h('div', {},
