@@ -135,6 +135,7 @@ textarea { min-height: 72px; resize: vertical; }
 .session { background: var(--card); border: 1px solid var(--line); border-radius: var(--radius); display: flex; gap: 14px; justify-content: space-between; align-items: center; padding: 14px; }
 .session h3 { font-size: 1rem; margin: 0 0 2px; }
 .session p { margin: 0; font-size: .9rem; }
+.session ul { margin: 2px 0; padding-left: 18px; }
 .session .actions { display: flex; gap: 8px; flex: none; align-items: center; }
 .empty { border: 1px dashed #d3ccc6; border-radius: var(--radius); color: var(--muted); padding: 28px 18px; text-align: center; }
 

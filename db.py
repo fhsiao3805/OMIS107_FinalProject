@@ -110,9 +110,15 @@ ADDED_COLUMNS = {
     "sessions": {"active_role": "TEXT CHECK (active_role IN ('student', 'tutor'))"},
     # The names of shared files; the files themselves are in Cloud Storage. A tutoring session can
     # have the tutor's file (on the time slot) and the student's file (on the booking).
-    "tutor_slots": {"attachment_name": "TEXT"},
+    "tutor_slots": {
+        "attachment_name": "TEXT",
+        # The tutor's message on a time slot: what they can help with.
+        "tutor_note": "TEXT NOT NULL DEFAULT ''",
+    },
     "bookings": {"attachment_name": "TEXT"},
     "study_groups": {"attachment_name": "TEXT"},
+    # Each member's message on a study group: what they want to study.
+    "study_group_members": {"note": "TEXT NOT NULL DEFAULT ''"},
 }
 
 

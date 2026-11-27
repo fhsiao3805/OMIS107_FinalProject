@@ -427,7 +427,7 @@ def create_app(data_dir=None, clock=None, secure_cookies=None, database_url=None
         stamp = now_iso()
 
         slots = rows(db.execute(
-            f"""SELECT s.id, s.starts_at AS "startsAt", s.ends_at AS "endsAt", s.location,
+            f"""SELECT s.id, s.starts_at AS "startsAt", s.ends_at AS "endsAt", s.location, s.tutor_note AS "tutorNote",
                   u.name AS "tutorName", u.bio AS "tutorBio", string_agg(tc.course_id::text, ',') AS "courseIds",
                   s.tutor_id = %(me)s AS mine
                 FROM tutor_slots s
@@ -489,7 +489,7 @@ def create_app(data_dir=None, clock=None, secure_cookies=None, database_url=None
     def tutor_upcoming_slots(db, stamp):
         """The tutor's upcoming, uncancelled slots, with the booking on each one that has been booked."""
         return rows(db.execute(
-            """SELECT s.id, s.starts_at AS "startsAt", s.ends_at AS "endsAt", s.location, b.note,
+            """SELECT s.id, s.starts_at AS "startsAt", s.ends_at AS "endsAt", s.location, b.note, s.tutor_note AS "tutorNote",
                  s.attachment_name AS "tutorFileName", b.attachment_name AS "studentFileName", st.name AS "studentName", st.email AS "studentEmail", c.subject, c.number, c.title
                FROM tutor_slots s
                LEFT JOIN bookings b ON b.slot_id = s.id
@@ -506,6 +506,7 @@ def create_app(data_dir=None, clock=None, secure_cookies=None, database_url=None
         data, upload = body_and_file()
         start, end = time_range(data, now())
         location = text_field(data.get("location"), "Location", 120)
+        tutor_note = text_field(data.get("tutorNote", ""), "Message", 500, min_length=0)
         repeat_weeks = 1 if data.get("repeatWeeks") is None else parse_int(data.get("repeatWeeks"))
         if repeat_weeks is None or not 1 <= repeat_weeks <= MAX_REPEAT_WEEKS:
             raise HttpError(400, f"Repeat must be between 1 and {MAX_REPEAT_WEEKS} weeks.")
@@ -518,10 +519,25 @@ def create_app(data_dir=None, clock=None, secure_cookies=None, database_url=None
                 ends_at = iso(add_weeks(end, week))
                 assert_schedule_free(g.user["id"], starts_at, ends_at, f"You already have something scheduled overlapping {starts_at[:10]}.")
                 ids.append(db.execute(
-                    "INSERT INTO tutor_slots (tutor_id, starts_at, ends_at, location) VALUES (%s, %s, %s, %s) RETURNING id",
-                    (g.user["id"], starts_at, ends_at, location),
+                    "INSERT INTO tutor_slots (tutor_id, starts_at, ends_at, location, tutor_note) VALUES (%s, %s, %s, %s, %s) RETURNING id",
+                    (g.user["id"], starts_at, ends_at, location, tutor_note),
                 ).fetchone()["id"])
         return jsonify(ids=ids, fileError=share_new_file(upload, attachments.slot_key, "tutor_slots", ids)), 201
+
+    @app.put("/api/tutor/slots/<int:slot_id>/note")
+    @tutor
+    def update_slot_note(slot_id):
+        """The tutor's message on one upcoming time slot, booked or not."""
+        tutor_note = text_field(body().get("tutorNote", ""), "Message", 500, min_length=0)
+        updated = get_db().execute(
+            """UPDATE tutor_slots SET tutor_note = %s
+               WHERE id = %s AND tutor_id = %s AND cancelled_at IS NULL AND ends_at > %s
+               RETURNING tutor_note""",
+            (tutor_note, slot_id, g.user["id"], now_iso()),
+        ).fetchone()
+        if updated is None:
+            raise HttpError(404, "Time slot not found.")
+        return jsonify(ok=True, tutorNote=updated["tutor_note"])
 
     @app.delete("/api/tutor/slots/<int:slot_id>")
     @tutor
@@ -618,6 +634,7 @@ def create_app(data_dir=None, clock=None, secure_cookies=None, database_url=None
         capacity = parse_int(data.get("capacity"))
         if capacity is None or not 2 <= capacity <= 30:
             raise HttpError(400, "Group size must be between 2 and 30.")
+        note = text_field(data.get("note", ""), "Message", 500, min_length=0)
 
         db = get_db()
         with transaction(db):
@@ -628,7 +645,9 @@ def create_app(data_dir=None, clock=None, secure_cookies=None, database_url=None
                    VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id""",
                 (course_id, g.user["id"], topic, starts_at, ends_at, location, capacity),
             ).fetchone()["id"]
-            db.execute("INSERT INTO study_group_members (group_id, user_id) VALUES (%s, %s)", (group_id, g.user["id"]))
+            db.execute(
+                "INSERT INTO study_group_members (group_id, user_id, note) VALUES (%s, %s, %s)", (group_id, g.user["id"], note)
+            )
         return jsonify(id=group_id, fileError=share_new_file(upload, attachments.group_key, "study_groups", [group_id])), 201
 
     @app.post("/api/groups/<int:group_id>/join")
@@ -650,6 +669,21 @@ def create_app(data_dir=None, clock=None, secure_cookies=None, database_url=None
             assert_schedule_free(g.user["id"], group["starts_at"], group["ends_at"])
             db.execute("INSERT INTO study_group_members (group_id, user_id) VALUES (%s, %s)", (group_id, g.user["id"]))
         return jsonify(ok=True), 201
+
+    @app.put("/api/groups/<int:group_id>/note")
+    @student
+    def update_group_note(group_id):
+        """The signed-in member's own message on an upcoming study group."""
+        note = text_field(body().get("note", ""), "Message", 500, min_length=0)
+        updated = get_db().execute(
+            """UPDATE study_group_members m SET note = %s FROM study_groups g
+               WHERE g.id = m.group_id AND m.group_id = %s AND m.user_id = %s AND g.ends_at > %s
+               RETURNING m.note""",
+            (note, group_id, g.user["id"], now_iso()),
+        ).fetchone()
+        if updated is None:
+            raise HttpError(404, "You are not in this group.")
+        return jsonify(ok=True, note=updated["note"])
 
     @app.delete("/api/groups/<int:group_id>/join")
     @student
@@ -687,7 +721,7 @@ def create_app(data_dir=None, clock=None, secure_cookies=None, database_url=None
     def student_bookings(db, stamp):
         return rows(db.execute(
             """SELECT s.id AS "slotId", s.starts_at AS "startsAt", s.ends_at AS "endsAt", s.location, s.cancelled_at AS "cancelledAt", b.note,
-                 s.attachment_name AS "tutorFileName", b.attachment_name AS "studentFileName", u.name AS "tutorName", u.email AS "tutorEmail", c.subject, c.number, c.title
+                 s.tutor_note AS "tutorNote", s.attachment_name AS "tutorFileName", b.attachment_name AS "studentFileName", u.name AS "tutorName", u.email AS "tutorEmail", c.subject, c.number, c.title
                FROM bookings b
                JOIN tutor_slots s ON s.id = b.slot_id
                JOIN users u ON u.id = s.tutor_id
@@ -709,10 +743,13 @@ def create_app(data_dir=None, clock=None, secure_cookies=None, database_url=None
         for group in groups:
             group["isCreator"] = bool(group["isCreator"])
             group["members"] = rows(db.execute(
-                """SELECT u.name, u.email FROM study_group_members m JOIN users u ON u.id = m.user_id
+                """SELECT u.name, u.email, m.note, m.user_id = %s AS "isMe"
+                   FROM study_group_members m JOIN users u ON u.id = m.user_id
                    WHERE m.group_id = %s ORDER BY u.name""",
-                (group["id"],),
+                (g.user["id"], group["id"]),
             ))
+            for member in group["members"]:
+                member["isMe"] = bool(member["isMe"])
         return groups
 
     # ---- Shared files ----

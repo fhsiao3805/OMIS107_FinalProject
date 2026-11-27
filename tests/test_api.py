@@ -295,6 +295,56 @@ def test_slot_booked_once_and_only_for_offered_course(app):
     assert view["note"] == "recursion"
 
 
+def test_tutor_shares_and_edits_slot_message(app):
+    tutor = User(app, "tutor")
+    tutor.put("/tutor/courses", {"courseIds": [1]})
+    assert tutor.post("/tutor/slots", {**span(24), "location": "L", "tutorNote": "x" * 501}).status_code == 400
+    res = tutor.post("/tutor/slots", {**span(24), "location": "L", "tutorNote": " recursion ", "repeatWeeks": 2})
+    first, second = res.json["ids"]
+
+    s = User(app, "student")
+    assert [x["tutorNote"] for x in s.get("/availability?courses=1").json["slots"]] == ["recursion", "recursion"]
+    s.post(f"/slots/{first}/book", {"courseId": 1})
+
+    # Editing one slot leaves the other alone, and the student who booked it sees the change.
+    assert tutor.put(f"/tutor/slots/{first}/note", {"tutorNote": "midterm review"}).json["tutorNote"] == "midterm review"
+    assert s.get("/me/schedule").json["bookings"][0]["tutorNote"] == "midterm review"
+    assert [x["tutorNote"] for x in tutor.get("/me/schedule").json["slots"]] == ["midterm review", "recursion"]
+
+    assert tutor.put(f"/tutor/slots/{first}/note", {"tutorNote": "x" * 501}).status_code == 400
+    assert User(app, "tutor").put(f"/tutor/slots/{first}/note", {"tutorNote": "mine"}).status_code == 404
+    assert s.put(f"/tutor/slots/{first}/note", {"tutorNote": "mine"}).status_code == 403
+    tutor.delete(f"/tutor/slots/{first}")
+    assert tutor.put(f"/tutor/slots/{first}/note", {"tutorNote": "too late"}).status_code == 404
+
+
+def test_slot_message_defaults_to_empty(app):
+    tutor, slot_id = tutor_with_slot(app)
+    assert tutor.get("/tutor/slots").json["slots"][0]["tutorNote"] == ""
+
+
+def test_group_members_share_and_edit_messages(app):
+    owner = User(app, "student")
+    assert owner.post("/groups", group_body(note="x" * 501)).status_code == 400
+    group_id = owner.post("/groups", group_body(note=" chapter 4 ")).json["id"]
+    member = User(app, "student")
+    member.post(f"/groups/{group_id}/join")
+
+    def notes(user):
+        return {m["email"]: (m["note"], m["isMe"]) for m in user.get("/me/schedule").json["groups"][0]["members"]}
+
+    assert notes(member) == {owner.email: ("chapter 4", False), member.email: ("", True)}
+    assert member.put(f"/groups/{group_id}/note", {"note": "recursion"}).json["note"] == "recursion"
+    assert owner.put(f"/groups/{group_id}/note", {"note": "midterm"}).status_code == 200
+    assert notes(owner) == {owner.email: ("midterm", True), member.email: ("recursion", False)}
+
+    assert member.put(f"/groups/{group_id}/note", {"note": "x" * 501}).status_code == 400
+    assert User(app, "student").put(f"/groups/{group_id}/note", {"note": "mine"}).status_code == 404
+    assert User(app, "tutor").put(f"/groups/{group_id}/note", {"note": "mine"}).status_code == 403
+    member.delete(f"/groups/{group_id}/join")
+    assert member.put(f"/groups/{group_id}/note", {"note": "gone"}).status_code == 404
+
+
 def test_student_edits_booking_note(app):
     tutor, slot_id = tutor_with_slot(app)
     s = User(app, "student")
